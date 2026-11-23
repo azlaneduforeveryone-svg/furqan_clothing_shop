@@ -6,21 +6,34 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- ----------------------------------------------------------------------------
--- 1. App Users (Role-Based PIN Login)
+-- 1. App Users (Links Supabase Auth Emails to Application Roles: ADMIN / STAFF)
+--    1) Enable Email provider in Supabase -> Authentication -> Providers
+--    2) Create these user accounts with passwords in Authentication -> Users
+--    3) Run this script to map their emails to ADMIN or STAFF roles
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.app_users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   username TEXT UNIQUE NOT NULL,
-  pin TEXT NOT NULL,
+  email TEXT UNIQUE,
+  pin TEXT DEFAULT '0000',
   role TEXT NOT NULL CHECK (role IN ('ADMIN', 'STAFF')),
   display_name TEXT NOT NULL
 );
 
-INSERT INTO public.app_users (username, pin, role, display_name)
+-- Safe migration if app_users already existed from the legacy PIN schema
+ALTER TABLE public.app_users ADD COLUMN IF NOT EXISTS email TEXT UNIQUE;
+ALTER TABLE public.app_users ALTER COLUMN pin DROP NOT NULL;
+ALTER TABLE public.app_users ALTER COLUMN pin SET DEFAULT '0000';
+
+INSERT INTO public.app_users (username, email, pin, role, display_name)
 VALUES
-  ('admin', '1234', 'ADMIN', 'Admin Owner'),
-  ('furqan', '1111', 'STAFF', 'Furqan (Shop Staff)')
-ON CONFLICT (username) DO NOTHING;
+  ('admin', 'azlaneduforeveryone@gmail.com', '0000', 'ADMIN', 'Azlan (Admin)'),
+  ('furqan', 'furqan@example.com', '0000', 'STAFF', 'Furqan (Shop Staff)')
+ON CONFLICT (username) DO UPDATE
+SET
+  email = EXCLUDED.email,
+  role = EXCLUDED.role,
+  display_name = EXCLUDED.display_name;
 
 -- ----------------------------------------------------------------------------
 -- 2. Expense Accounts

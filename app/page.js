@@ -9,11 +9,14 @@ import {
   Calculator,
   CheckCircle2,
   Edit3,
+  Eye,
+  EyeOff,
   FileSpreadsheet,
   FileText,
   Layers,
   Lock,
   LogOut,
+  Mail,
   Package,
   Plus,
   PlusCircle,
@@ -21,10 +24,8 @@ import {
   RefreshCw,
   RotateCcw,
   Share2,
-  ShieldCheck,
   Shirt,
   Trash2,
-  User,
   Wallet,
   X,
   Zap,
@@ -108,8 +109,9 @@ export default function FurqanClothApp() {
   // Auth / Session state
   const [sessionUser, setSessionUser] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
-  const [selectedUsername, setSelectedUsername] = useState("furqan");
-  const [pinInput, setPinInput] = useState("");
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [loginLoading, setLoginLoading] = useState(false);
   const [loginError, setLoginError] = useState("");
 
@@ -163,22 +165,119 @@ export default function FurqanClothApp() {
     }, 3200);
   }, []);
 
-  // Hydrate saved session from localStorage
-  useEffect(() => {
+  // Look up user's role in app_users by Supabase Auth email
+  const resolveUserProfile = useCallback(async (authUser) => {
+    const normalizedEmail = String(authUser?.email || "").toLowerCase();
+    const fallbackProfile = {
+      id: authUser?.id || "",
+      email: authUser?.email || "",
+      role: "STAFF",
+      display_name: authUser?.email || "Staff",
+    };
+
+    if (!supabase || !normalizedEmail) {
+      return fallbackProfile;
+    }
+
     try {
-      const saved = window.localStorage.getItem(SESSION_STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (parsed?.username && parsed?.role) {
-          setSessionUser(parsed);
-        }
+      const { data, error } = await supabase
+        .from("app_users")
+        .select("id, username, email, role, display_name")
+        .eq("email", normalizedEmail)
+        .single();
+
+      if (error || !data) {
+        return fallbackProfile;
       }
+
+      return {
+        id: data.id || authUser.id,
+        username: data.username || "",
+        email: data.email || authUser.email,
+        role: data.role === "ADMIN" ? "ADMIN" : "STAFF",
+        display_name: data.display_name || authUser.email,
+      };
     } catch {
-      // Ignore storage errors
-    } finally {
-      setAuthChecked(true);
+      return fallbackProfile;
     }
   }, []);
+
+  // Hydrate Supabase Auth session on load & subscribe to auth state changes
+  useEffect(() => {
+    let isMounted = true;
+
+    if (!supabase) {
+      setAuthChecked(true);
+      return;
+    }
+
+    const syncSession = async () => {
+      try {
+        const { data } = await supabase.auth.getSession();
+        if (!isMounted) return;
+
+        if (data?.session?.user) {
+          const profile = await resolveUserProfile(data.session.user);
+          if (!isMounted) return;
+          setSessionUser(profile);
+          try {
+            window.localStorage.setItem(
+              SESSION_STORAGE_KEY,
+              JSON.stringify(profile)
+            );
+          } catch {
+            // Ignore storage errors
+          }
+        } else {
+          setSessionUser(null);
+          try {
+            window.localStorage.removeItem(SESSION_STORAGE_KEY);
+          } catch {
+            // Ignore storage errors
+          }
+        }
+      } catch {
+        if (isMounted) setSessionUser(null);
+      } finally {
+        if (isMounted) setAuthChecked(true);
+      }
+    };
+
+    syncSession();
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!isMounted) return;
+      if (session?.user) {
+        resolveUserProfile(session.user).then((profile) => {
+          if (!isMounted) return;
+          setSessionUser(profile);
+          try {
+            window.localStorage.setItem(
+              SESSION_STORAGE_KEY,
+              JSON.stringify(profile)
+            );
+          } catch {
+            // Ignore storage errors
+          }
+        });
+      } else {
+        setSessionUser(null);
+        setTransactions([]);
+        try {
+          window.localStorage.removeItem(SESSION_STORAGE_KEY);
+        } catch {
+          // Ignore storage errors
+        }
+      }
+    });
+
+    return () => {
+      isMounted = false;
+      subscription?.unsubscribe();
+    };
+  }, [resolveUserProfile]);
 
   // Load transactions & expense accounts from Supabase
   const fetchAllData = useCallback(async () => {
@@ -342,7 +441,7 @@ export default function FurqanClothApp() {
     return { pieces, bPrice, tCost, lCost, totalOutflow, perPiece };
   }, [piecesCount, bundlePrice, transportCost, labourCost]);
 
-  // Login Handler
+  // Email & Password Login Handler (Supabase Auth)
   const handleLogin = async (e) => {
     e.preventDefault();
     setLoginError("");
@@ -354,52 +453,61 @@ export default function FurqanClothApp() {
       return;
     }
 
-    if (!pinInput.trim()) {
-      setLoginError("Please enter your PIN.");
+    const email = loginEmail.trim().toLowerCase();
+    if (!email || !loginPassword) {
+      setLoginError("Please enter both your email and password.");
       return;
     }
 
     setLoginLoading(true);
     try {
-      const { data, error } = await supabase
-        .from("app_users")
-        .select("id, username, role, display_name, pin")
-        .eq("username", selectedUsername)
-        .single();
+      const { data: authData, error: authError } =
+        await supabase.auth.signInWithPassword({
+          email,
+          password: loginPassword,
+        });
 
-      if (error || !data) {
+      if (authError || !authData?.user) {
         setLoginError(
-          "User not found in database. Please run supabase/schema.sql first."
+          authError?.message || "Invalid email or password. Please try again."
         );
         return;
       }
 
-      if (String(data.pin) !== String(pinInput.trim())) {
-        setLoginError("Incorrect PIN. Please try again.");
-        return;
+      const profile = await resolveUserProfile(authData.user);
+      try {
+        window.localStorage.setItem(
+          SESSION_STORAGE_KEY,
+          JSON.stringify(profile)
+        );
+      } catch {
+        // Ignore storage errors
       }
-
-      const safeUser = {
-        id: data.id,
-        username: data.username,
-        role: data.role,
-        display_name: data.display_name,
-      };
-      window.localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(safeUser));
-      setSessionUser(safeUser);
-      setPinInput("");
+      setSessionUser(profile);
+      setLoginPassword("");
     } catch (err) {
-      setLoginError(err?.message || "Login failed. Check your connection.");
+      setLoginError(err?.message || "Sign in failed. Check your connection.");
     } finally {
       setLoginLoading(false);
     }
   };
 
-  const handleLogout = () => {
-    window.localStorage.removeItem(SESSION_STORAGE_KEY);
+  const handleLogout = async () => {
+    try {
+      if (supabase) {
+        await supabase.auth.signOut();
+      }
+    } catch {
+      // Proceed with local cleanup even if signOut request fails
+    }
+    try {
+      window.localStorage.removeItem(SESSION_STORAGE_KEY);
+    } catch {
+      // Ignore storage errors
+    }
     setSessionUser(null);
     setTransactions([]);
-    setPinInput("");
+    setLoginPassword("");
     setActiveModal(null);
     setEditingTx(null);
   };
@@ -806,67 +914,64 @@ export default function FurqanClothApp() {
             )}
 
             <div>
-              <label className="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-2">
-                Select Account
+              <label
+                htmlFor="login-email"
+                className="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-2"
+              >
+                Email Address
               </label>
-              <div className="grid grid-cols-2 gap-3">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSelectedUsername("furqan");
-                    setLoginError("");
+              <div className="relative">
+                <Mail className="w-5 h-5 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                <input
+                  id="login-email"
+                  type="email"
+                  required
+                  value={loginEmail}
+                  onChange={(e) => {
+                    setLoginEmail(e.target.value);
+                    if (loginError) setLoginError("");
                   }}
-                  className={`flex flex-col items-center gap-1.5 p-3.5 rounded-2xl border-2 transition-all ${
-                    selectedUsername === "furqan"
-                      ? "border-emerald-600 bg-emerald-50 text-emerald-900 shadow-sm"
-                      : "border-slate-200 bg-slate-50 text-slate-600 hover:border-slate-300"
-                  }`}
-                >
-                  <User className="w-6 h-6" />
-                  <span className="font-bold text-sm">Furqan</span>
-                  <span className="text-[11px] opacity-75">Shop Staff</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSelectedUsername("admin");
-                    setLoginError("");
-                  }}
-                  className={`flex flex-col items-center gap-1.5 p-3.5 rounded-2xl border-2 transition-all ${
-                    selectedUsername === "admin"
-                      ? "border-slate-900 bg-slate-100 text-slate-900 shadow-sm"
-                      : "border-slate-200 bg-slate-50 text-slate-600 hover:border-slate-300"
-                  }`}
-                >
-                  <ShieldCheck className="w-6 h-6" />
-                  <span className="font-bold text-sm">Admin</span>
-                  <span className="text-[11px] opacity-75">Owner Access</span>
-                </button>
+                  placeholder="you@example.com"
+                  autoComplete="email"
+                  className="w-full pl-11 pr-4 py-3.5 rounded-xl border border-slate-300 text-sm font-medium text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900 focus:border-slate-900"
+                />
               </div>
             </div>
 
             <div>
               <label
-                htmlFor="pin-input"
+                htmlFor="login-password"
                 className="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-2"
               >
-                Enter 4-Digit PIN
+                Password
               </label>
               <div className="relative">
                 <Lock className="w-5 h-5 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                 <input
-                  id="pin-input"
-                  type="password"
-                  inputMode="numeric"
-                  pattern="[0-9]*"
-                  maxLength={8}
-                  value={pinInput}
-                  onChange={(e) => setPinInput(e.target.value)}
-                  placeholder="••••"
+                  id="login-password"
+                  type={showPassword ? "text" : "password"}
+                  required
+                  value={loginPassword}
+                  onChange={(e) => {
+                    setLoginPassword(e.target.value);
+                    if (loginError) setLoginError("");
+                  }}
+                  placeholder="Enter password"
                   autoComplete="current-password"
-                  className="w-full pl-11 pr-4 py-3.5 rounded-xl border border-slate-300 text-center text-2xl tracking-[0.5em] font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-900 focus:border-slate-900"
+                  className="w-full pl-11 pr-12 py-3.5 rounded-xl border border-slate-300 text-sm font-medium text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900 focus:border-slate-900"
                 />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((prev) => !prev)}
+                  aria-label={showPassword ? "Hide password" : "Show password"}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-slate-400 hover:text-slate-700 transition-colors"
+                >
+                  {showPassword ? (
+                    <EyeOff className="w-5 h-5" />
+                  ) : (
+                    <Eye className="w-5 h-5" />
+                  )}
+                </button>
               </div>
             </div>
 
@@ -881,7 +986,7 @@ export default function FurqanClothApp() {
               disabled={loginLoading}
               className="w-full py-3.5 rounded-xl bg-slate-900 hover:bg-slate-800 active:scale-[0.99] text-white font-bold text-base shadow-md transition-all disabled:opacity-60"
             >
-              {loginLoading ? "Signing in..." : "Unlock Cash Ledger"}
+              {loginLoading ? "Signing in..." : "Sign In"}
             </button>
           </form>
         </div>
