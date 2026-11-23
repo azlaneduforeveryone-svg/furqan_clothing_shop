@@ -127,9 +127,15 @@ export default function FurqanClothApp() {
   const [toast, setToast] = useState(null);
 
   // Modal state
-  const [activeModal, setActiveModal] = useState(null); // null | 'SALE' | 'PURCHASE' | 'EXPENSE' | 'ACCOUNT' | 'RESET'
+  const [activeModal, setActiveModal] = useState(null); // null | 'SALE' | 'PURCHASE' | 'EXPENSE' | 'CAPITAL' | 'ACCOUNT' | 'RESET'
   const [editingTx, setEditingTx] = useState(null);
   const [submitting, setSubmitting] = useState(false);
+
+  // Capital form state (ADMIN only)
+  const [capitalDate, setCapitalDate] = useState(getTodayISO());
+  const [capitalSource, setCapitalSource] = useState("Additional Capital");
+  const [capitalAmount, setCapitalAmount] = useState("");
+  const [capitalNotes, setCapitalNotes] = useState("");
 
   // Sale form state
   const [saleDate, setSaleDate] = useState(getTodayISO());
@@ -580,6 +586,23 @@ export default function FurqanClothApp() {
     setActiveModal("EXPENSE");
   };
 
+  const openCapitalModal = (tx = null) => {
+    if (!isAdmin) return;
+    setEditingTx(tx);
+    if (tx) {
+      setCapitalDate(tx.tx_date || getTodayISO());
+      setCapitalSource(tx.category || "Additional Capital");
+      setCapitalAmount(String(Math.abs(Number(tx.total_amount) || 0)));
+      setCapitalNotes(tx.description || "");
+    } else {
+      setCapitalDate(getTodayISO());
+      setCapitalSource("Additional Capital");
+      setCapitalAmount("");
+      setCapitalNotes("");
+    }
+    setActiveModal("CAPITAL");
+  };
+
   const openEditTransaction = (tx) => {
     if (!isAdmin) return;
     if (tx.tx_type === "SALE") {
@@ -589,7 +612,7 @@ export default function FurqanClothApp() {
     } else if (tx.tx_type === "EXPENSE") {
       openExpenseModal(null, null, tx);
     } else if (tx.tx_type === "CAPITAL") {
-      openSaleModal(tx);
+      openCapitalModal(tx);
     }
   };
 
@@ -733,6 +756,51 @@ export default function FurqanClothApp() {
       showToast(editingTx ? "Expense updated." : "Shop expense recorded!");
     } catch (err) {
       showToast(err?.message || "Could not save expense.", "error");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // Save Capital Injection (ADMIN ONLY)
+  const handleSaveCapital = async (e) => {
+    e.preventDefault();
+    if (!isAdmin || !supabase) return;
+
+    const amount = parseAmount(capitalAmount);
+    if (amount <= 0) {
+      showToast("Enter a valid positive capital amount.", "error");
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      const payload = {
+        tx_date: capitalDate,
+        tx_type: "CAPITAL",
+        category: capitalSource.trim() || "Additional Capital",
+        description: capitalNotes.trim(),
+        pieces_count: 0,
+        bundle_price: 0,
+        transport_cost: 0,
+        labour_other_cost: 0,
+        total_amount: amount,
+      };
+
+      const { error } = editingTx
+        ? await supabase
+            .from("transactions")
+            .update(payload)
+            .eq("id", editingTx.id)
+        : await supabase.from("transactions").insert([payload]);
+
+      if (error) throw error;
+      await fetchAllData();
+      closeModal();
+      showToast(
+        editingTx ? "Capital entry updated." : "Additional capital added!"
+      );
+    } catch (err) {
+      showToast(err?.message || "Could not save capital entry.", "error");
     } finally {
       setSubmitting(false);
     }
@@ -1150,21 +1218,31 @@ export default function FurqanClothApp() {
             </button>
           </section>
 
-          {/* 1-Tap Monthly Shop Bills + Admin Expense Account */}
+          {/* 1-Tap Monthly Shop Bills + Admin Quick Actions */}
           <section className="rounded-2xl bg-white border border-slate-200 p-3.5 shadow-xs space-y-2.5">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
               <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
                 1-Tap Monthly Shop Bills
               </span>
               {isAdmin && (
-                <button
-                  type="button"
-                  onClick={() => setActiveModal("ACCOUNT")}
-                  className="inline-flex items-center gap-1 text-xs font-bold text-slate-800 bg-slate-100 hover:bg-slate-200 px-2.5 py-1 rounded-lg transition-colors"
-                >
-                  <PlusCircle className="w-3.5 h-3.5" />
-                  Expense Account
-                </button>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => openCapitalModal()}
+                    className="inline-flex items-center gap-1 text-xs font-bold text-indigo-800 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 px-2.5 py-1 rounded-lg transition-colors"
+                  >
+                    <PlusCircle className="w-3.5 h-3.5" />
+                    Add Capital
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveModal("ACCOUNT")}
+                    className="inline-flex items-center gap-1 text-xs font-bold text-slate-800 bg-slate-100 hover:bg-slate-200 px-2.5 py-1 rounded-lg transition-colors"
+                  >
+                    <PlusCircle className="w-3.5 h-3.5" />
+                    Expense Account
+                  </button>
+                </div>
               )}
             </div>
 
@@ -1375,13 +1453,13 @@ export default function FurqanClothApp() {
                       ? "bg-emerald-50 border-emerald-200 text-emerald-900"
                       : isSpending
                       ? "bg-rose-50 border-rose-200 text-rose-900"
-                      : "bg-slate-100 border-slate-200 text-slate-900";
+                      : "bg-indigo-50 border-indigo-200 text-indigo-900";
 
                     const amountClass = isSale
                       ? "text-emerald-700"
                       : isSpending
                       ? "text-rose-700"
-                      : "text-slate-800";
+                      : "text-indigo-700";
 
                     return (
                       <div
@@ -1397,7 +1475,7 @@ export default function FurqanClothApp() {
                                     ? "bg-emerald-200/70 text-emerald-900"
                                     : isSpending
                                     ? "bg-rose-200/70 text-rose-900"
-                                    : "bg-slate-200 text-slate-700"
+                                    : "bg-indigo-200/70 text-indigo-900"
                                 }`}
                               >
                                 {tx.tx_type}
@@ -1911,7 +1989,100 @@ export default function FurqanClothApp() {
         </div>
       )}
 
-      {/* 4. ADD EXPENSE ACCOUNT MODAL (ADMIN ONLY) */}
+      {/* 4. ADD / EDIT CAPITAL MODAL (ADMIN ONLY) */}
+      {activeModal === "CAPITAL" && isAdmin && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4">
+          <div className="w-full max-w-lg bg-white rounded-t-3xl sm:rounded-3xl shadow-2xl overflow-hidden max-h-[92vh] overflow-y-auto">
+            <div className="flex items-center justify-between px-5 py-4 bg-indigo-600 text-white">
+              <h2 className="font-bold text-base flex items-center gap-2">
+                <Wallet className="w-5 h-5" />
+                {editingTx ? "Edit Capital Entry" : "Add Capital"}
+              </h2>
+              <button
+                type="button"
+                onClick={closeModal}
+                className="p-1.5 rounded-lg hover:bg-indigo-700"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveCapital} className="p-5 space-y-4">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">
+                    Date
+                  </label>
+                  <input
+                    type="date"
+                    required
+                    value={capitalDate}
+                    onChange={(e) => setCapitalDate(e.target.value)}
+                    className="w-full px-3 py-2.5 rounded-xl border border-slate-300 text-sm font-medium focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">
+                    Amount (PKR)
+                  </label>
+                  <input
+                    type="number"
+                    inputMode="decimal"
+                    min="1"
+                    step="any"
+                    required
+                    placeholder="e.g. 50000"
+                    value={capitalAmount}
+                    onChange={(e) => setCapitalAmount(e.target.value)}
+                    className="w-full px-3 py-2.5 rounded-xl border border-slate-300 text-sm font-bold text-indigo-800 focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1">
+                  Capital Source
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={capitalSource}
+                  onChange={(e) => setCapitalSource(e.target.value)}
+                  placeholder="Additional Capital"
+                  className="w-full px-3 py-2.5 rounded-xl border border-slate-300 text-sm font-medium focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1">
+                  Note (Optional)
+                </label>
+                <input
+                  type="text"
+                  value={capitalNotes}
+                  onChange={(e) => setCapitalNotes(e.target.value)}
+                  placeholder="e.g. Owner cash top-up for winter stock"
+                  className="w-full px-3 py-2.5 rounded-xl border border-slate-300 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={submitting}
+                className="w-full py-3.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-sm shadow-md disabled:opacity-60"
+              >
+                {submitting
+                  ? "Saving..."
+                  : editingTx
+                  ? "Update Capital Entry"
+                  : "Save Capital"}
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* 5. ADD EXPENSE ACCOUNT MODAL (ADMIN ONLY) */}
       {activeModal === "ACCOUNT" && isAdmin && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4">
           <div className="w-full max-w-md bg-white rounded-t-3xl sm:rounded-3xl shadow-2xl overflow-hidden">

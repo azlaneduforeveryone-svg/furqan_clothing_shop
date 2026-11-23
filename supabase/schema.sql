@@ -28,7 +28,7 @@ ALTER TABLE public.app_users ALTER COLUMN pin SET DEFAULT '0000';
 INSERT INTO public.app_users (username, email, pin, role, display_name)
 VALUES
   ('admin', 'azlaneduforeveryone@gmail.com', '0000', 'ADMIN', 'Azlan (Admin)'),
-  ('furqan', 'furqan@example.com', '0000', 'STAFF', 'Furqan (Shop Staff)')
+  ('furqan', 'furqan.mahmood95@gmail.com', '0000', 'STAFF', 'Furqan (Shop Staff)')
 ON CONFLICT (username) DO UPDATE
 SET
   email = EXCLUDED.email,
