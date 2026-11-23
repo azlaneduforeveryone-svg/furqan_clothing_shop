@@ -520,7 +520,7 @@ export default function FurqanClothApp() {
 
   // Modal Open Helpers
   const openSaleModal = (tx = null) => {
-    if (tx && !isAdmin) return;
+    if (tx?.tx_type === "CAPITAL" && !isAdmin) return;
     setEditingTx(tx);
     if (tx) {
       setSaleDate(tx.tx_date || getTodayISO());
@@ -537,7 +537,6 @@ export default function FurqanClothApp() {
   };
 
   const openPurchaseModal = (tx = null) => {
-    if (tx && !isAdmin) return;
     setEditingTx(tx);
     if (tx) {
       setPurchaseDate(tx.tx_date || getTodayISO());
@@ -560,7 +559,6 @@ export default function FurqanClothApp() {
   };
 
   const openExpenseModal = (presetAccountName = null, presetAmount = null, tx = null) => {
-    if (tx && !isAdmin) return;
     setEditingTx(tx);
     if (tx) {
       setExpenseDate(tx.tx_date || getTodayISO());
@@ -604,15 +602,15 @@ export default function FurqanClothApp() {
   };
 
   const openEditTransaction = (tx) => {
-    if (!isAdmin) return;
-    if (tx.tx_type === "SALE") {
+    if (tx.tx_type === "CAPITAL") {
+      if (!isAdmin) return;
+      openCapitalModal(tx);
+    } else if (tx.tx_type === "SALE") {
       openSaleModal(tx);
     } else if (tx.tx_type === "PURCHASE") {
       openPurchaseModal(tx);
     } else if (tx.tx_type === "EXPENSE") {
       openExpenseModal(null, null, tx);
-    } else if (tx.tx_type === "CAPITAL") {
-      openCapitalModal(tx);
     }
   };
 
@@ -621,11 +619,11 @@ export default function FurqanClothApp() {
     setEditingTx(null);
   };
 
-  // Save Sale (or Capital edit)
+  // Save Sale (ADMIN or STAFF)
   const handleSaveSale = async (e) => {
     e.preventDefault();
-    if (!supabase) return;
-    if (editingTx && !isAdmin) return;
+    if (!supabase || !sessionUser) return;
+    if (editingTx?.tx_type === "CAPITAL" && !isAdmin) return;
 
     const amount = parseAmount(saleAmount);
     if (amount <= 0) {
@@ -665,11 +663,10 @@ export default function FurqanClothApp() {
     }
   };
 
-  // Save Bundle Purchase
+  // Save Bundle Purchase (ADMIN or STAFF)
   const handleSavePurchase = async (e) => {
     e.preventDefault();
-    if (!supabase) return;
-    if (editingTx && !isAdmin) return;
+    if (!supabase || !sessionUser) return;
 
     const { pieces, bPrice, tCost, lCost, totalOutflow } = bundlePreview;
     if (pieces <= 0) {
@@ -717,11 +714,10 @@ export default function FurqanClothApp() {
     }
   };
 
-  // Save Expense
+  // Save Expense (ADMIN or STAFF)
   const handleSaveExpense = async (e) => {
     e.preventDefault();
-    if (!supabase) return;
-    if (editingTx && !isAdmin) return;
+    if (!supabase || !sessionUser) return;
 
     const amount = parseAmount(expenseAmount);
     if (amount <= 0) {
@@ -806,9 +802,9 @@ export default function FurqanClothApp() {
     }
   };
 
-  // Delete Transaction (ADMIN ONLY)
+  // Delete Transaction (ADMIN ONLY, non-CAPITAL)
   const handleDeleteTransaction = async (tx) => {
-    if (!isAdmin || !supabase) return;
+    if (!isAdmin || !supabase || tx.tx_type === "CAPITAL") return;
     const confirmed = window.confirm(
       `Delete this ${tx.tx_type} entry (${tx.category} - ${formatPKR(
         Math.abs(Number(tx.total_amount) || 0)
@@ -1504,8 +1500,8 @@ export default function FurqanClothApp() {
                               {formatPKR(Math.abs(amt))}
                             </div>
 
-                            {/* Admin-only Edit & Delete */}
-                            {isAdmin && (
+                            {/* Edit (Admin & Staff; CAPITAL Admin-only) & Delete (Admin-only, non-CAPITAL) */}
+                            {(tx.tx_type !== "CAPITAL" || isAdmin) && (
                               <div className="mt-2 flex items-center justify-end gap-1.5">
                                 <button
                                   type="button"
@@ -1515,14 +1511,16 @@ export default function FurqanClothApp() {
                                   <Edit3 className="w-3 h-3" />
                                   Edit
                                 </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleDeleteTransaction(tx)}
-                                  className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white/85 hover:bg-rose-100 border border-rose-200 text-rose-700 text-[11px] font-semibold"
-                                >
-                                  <Trash2 className="w-3 h-3" />
-                                  Delete
-                                </button>
+                                {isAdmin && tx.tx_type !== "CAPITAL" && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDeleteTransaction(tx)}
+                                    className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white/85 hover:bg-rose-100 border border-rose-200 text-rose-700 text-[11px] font-semibold"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                    Delete
+                                  </button>
+                                )}
                               </div>
                             )}
                           </div>
