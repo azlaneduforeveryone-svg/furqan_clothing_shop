@@ -18,6 +18,7 @@ import {
   LogOut,
   Mail,
   Package,
+  Pencil,
   Plus,
   PlusCircle,
   Receipt,
@@ -69,6 +70,8 @@ const DEFAULT_EXPENSE_ACCOUNTS = [
   { name: "Other Shop Expense", default_amount: 0 },
 ];
 
+const PROTECTED_EXPENSE_ACCOUNTS = new Set(["Shop Rent", "Electricity Bill"]);
+
 function getTodayISO() {
   const now = new Date();
   const y = now.getFullYear();
@@ -103,6 +106,18 @@ function formatShortDate(isoDate) {
 function parseAmount(value) {
   const n = parseFloat(value);
   return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
+const UNAUTHORISED_ACCOUNT_MSG =
+  "This account is not authorised for this shop. Contact the admin.";
+
+function formatSupabaseError(err, fallbackMessage) {
+  console.error(fallbackMessage, err);
+  const rawMessage = String(err?.message || "");
+  if (rawMessage.toLowerCase().includes("row-level security")) {
+    return "You don't have permission for this action.";
+  }
+  return rawMessage || fallbackMessage;
 }
 
 export default function FurqanClothApp() {
@@ -158,7 +173,8 @@ export default function FurqanClothApp() {
   const [expenseAmount, setExpenseAmount] = useState("");
   const [expenseNotes, setExpenseNotes] = useState("");
 
-  // New Expense Account form state (ADMIN only)
+  // Expense Account form state (ADMIN & STAFF add/edit; ADMIN delete)
+  const [editingAccount, setEditingAccount] = useState(null);
   const [newAccountName, setNewAccountName] = useState("");
   const [newAccountDefault, setNewAccountDefault] = useState("0");
 
@@ -171,18 +187,12 @@ export default function FurqanClothApp() {
     }, 3200);
   }, []);
 
-  // Look up user's role in app_users by Supabase Auth email
+  // Look up user's role in app_users by Supabase Auth email (no fallback for unknown emails)
   const resolveUserProfile = useCallback(async (authUser) => {
     const normalizedEmail = String(authUser?.email || "").toLowerCase();
-    const fallbackProfile = {
-      id: authUser?.id || "",
-      email: authUser?.email || "",
-      role: "STAFF",
-      display_name: authUser?.email || "Staff",
-    };
 
     if (!supabase || !normalizedEmail) {
-      return fallbackProfile;
+      return null;
     }
 
     try {
@@ -190,21 +200,27 @@ export default function FurqanClothApp() {
         .from("app_users")
         .select("id, username, email, role, display_name")
         .eq("email", normalizedEmail)
-        .single();
+        .maybeSingle();
 
-      if (error || !data) {
-        return fallbackProfile;
+      if (error) {
+        console.error("app_users lookup failed:", error);
+        return null;
+      }
+
+      if (!data || (data.role !== "ADMIN" && data.role !== "STAFF")) {
+        return null;
       }
 
       return {
         id: data.id || authUser.id,
         username: data.username || "",
         email: data.email || authUser.email,
-        role: data.role === "ADMIN" ? "ADMIN" : "STAFF",
+        role: data.role,
         display_name: data.display_name || authUser.email,
       };
-    } catch {
-      return fallbackProfile;
+    } catch (err) {
+      console.error("app_users lookup exception:", err);
+      return null;
     }
   }, []);
 
@@ -217,6 +233,23 @@ export default function FurqanClothApp() {
       return;
     }
 
+    const rejectUnauthorised = async () => {
+      try {
+        await supabase.auth.signOut();
+      } catch (err) {
+        console.error("Sign out after unauthorised check failed:", err);
+      }
+      try {
+        window.localStorage.removeItem(SESSION_STORAGE_KEY);
+      } catch {
+        // Ignore storage errors
+      }
+      if (!isMounted) return;
+      setSessionUser(null);
+      setTransactions([]);
+      setLoginError(UNAUTHORISED_ACCOUNT_MSG);
+    };
+
     const syncSession = async () => {
       try {
         const { data } = await supabase.auth.getSession();
@@ -225,6 +258,10 @@ export default function FurqanClothApp() {
         if (data?.session?.user) {
           const profile = await resolveUserProfile(data.session.user);
           if (!isMounted) return;
+          if (!profile) {
+            await rejectUnauthorised();
+            return;
+          }
           setSessionUser(profile);
           try {
             window.localStorage.setItem(
@@ -258,6 +295,10 @@ export default function FurqanClothApp() {
       if (session?.user) {
         resolveUserProfile(session.user).then((profile) => {
           if (!isMounted) return;
+          if (!profile) {
+            rejectUnauthorised();
+            return;
+          }
           setSessionUser(profile);
           try {
             window.localStorage.setItem(
@@ -481,6 +522,18 @@ export default function FurqanClothApp() {
       }
 
       const profile = await resolveUserProfile(authData.user);
+      if (!profile) {
+        await supabase.auth.signOut();
+        try {
+          window.localStorage.removeItem(SESSION_STORAGE_KEY);
+        } catch {
+          // Ignore storage errors
+        }
+        setSessionUser(null);
+        setLoginError(UNAUTHORISED_ACCOUNT_MSG);
+        return;
+      }
+
       try {
         window.localStorage.setItem(
           SESSION_STORAGE_KEY,
@@ -617,6 +670,9 @@ export default function FurqanClothApp() {
   const closeModal = () => {
     setActiveModal(null);
     setEditingTx(null);
+    setEditingAccount(null);
+    setNewAccountName("");
+    setNewAccountDefault("0");
   };
 
   // Save Sale (ADMIN or STAFF)
@@ -657,7 +713,7 @@ export default function FurqanClothApp() {
       closeModal();
       showToast(editingTx ? "Entry updated." : "Cash sale recorded!");
     } catch (err) {
-      showToast(err?.message || "Could not save sale.", "error");
+      showToast(formatSupabaseError(err, "Could not save sale."), "error");
     } finally {
       setSubmitting(false);
     }
@@ -708,7 +764,10 @@ export default function FurqanClothApp() {
           : "Bundle purchase recorded!"
       );
     } catch (err) {
-      showToast(err?.message || "Could not save bundle purchase.", "error");
+      showToast(
+        formatSupabaseError(err, "Could not save bundle purchase."),
+        "error"
+      );
     } finally {
       setSubmitting(false);
     }
@@ -751,7 +810,7 @@ export default function FurqanClothApp() {
       closeModal();
       showToast(editingTx ? "Expense updated." : "Shop expense recorded!");
     } catch (err) {
-      showToast(err?.message || "Could not save expense.", "error");
+      showToast(formatSupabaseError(err, "Could not save expense."), "error");
     } finally {
       setSubmitting(false);
     }
@@ -796,7 +855,10 @@ export default function FurqanClothApp() {
         editingTx ? "Capital entry updated." : "Additional capital added!"
       );
     } catch (err) {
-      showToast(err?.message || "Could not save capital entry.", "error");
+      showToast(
+        formatSupabaseError(err, "Could not save capital entry."),
+        "error"
+      );
     } finally {
       setSubmitting(false);
     }
@@ -821,37 +883,123 @@ export default function FurqanClothApp() {
       await fetchAllData();
       showToast("Transaction deleted.");
     } catch (err) {
-      showToast(err?.message || "Failed to delete entry.", "error");
+      showToast(formatSupabaseError(err, "Failed to delete entry."), "error");
     }
   };
 
-  // Add New Expense Account (ADMIN ONLY)
+  // Add or Edit Expense Account (ADMIN & STAFF)
   const handleAddExpenseAccount = async (e) => {
     e.preventDefault();
-    if (!isAdmin || !supabase) return;
+    if (!supabase || !sessionUser) return;
 
-    const name = newAccountName.trim();
+    const isEditingProtected = Boolean(
+      editingAccount && PROTECTED_EXPENSE_ACCOUNTS.has(editingAccount.name)
+    );
+    const name = isEditingProtected
+      ? editingAccount.name
+      : newAccountName.trim();
     if (!name) {
       showToast("Enter an expense account name.", "error");
       return;
     }
 
+    const duplicate = expenseAccounts.some(
+      (acc) =>
+        acc.name.trim().toLowerCase() === name.toLowerCase() &&
+        (!editingAccount || acc.id !== editingAccount.id)
+    );
+    if (duplicate) {
+      showToast("An expense account with this name already exists.", "error");
+      return;
+    }
+
     setSubmitting(true);
     try {
-      const { error } = await supabase.from("expense_accounts").insert([
-        {
-          name,
-          default_amount: parseAmount(newAccountDefault),
-        },
-      ]);
-      if (error) throw error;
-      await fetchAllData();
-      setNewAccountName("");
-      setNewAccountDefault("0");
-      closeModal();
-      showToast(`Added "${name}" expense account.`);
+      if (editingAccount) {
+        const { error } = await supabase.rpc("rename_expense_account", {
+          p_id: editingAccount.id,
+          p_name: name,
+          p_default: parseAmount(newAccountDefault),
+        });
+        if (error) throw error;
+
+        await fetchAllData();
+        setEditingAccount(null);
+        setNewAccountName("");
+        setNewAccountDefault("0");
+        showToast(`Updated "${name}" expense account.`);
+      } else {
+        const { error } = await supabase.from("expense_accounts").insert([
+          {
+            name,
+            default_amount: parseAmount(newAccountDefault),
+          },
+        ]);
+        if (error) throw error;
+        await fetchAllData();
+        setNewAccountName("");
+        setNewAccountDefault("0");
+        showToast(`Added "${name}" expense account.`);
+      }
     } catch (err) {
-      showToast(err?.message || "Could not add expense account.", "error");
+      showToast(
+        formatSupabaseError(
+          err,
+          editingAccount
+            ? "Could not update expense account."
+            : "Could not add expense account."
+        ),
+        "error"
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // Delete Expense Account (ADMIN ONLY)
+  const handleDeleteExpenseAccount = async (account) => {
+    if (
+      !isAdmin ||
+      !supabase ||
+      !account?.id ||
+      PROTECTED_EXPENSE_ACCOUNTS.has(account.name)
+    ) {
+      return;
+    }
+
+    const hasEntries = transactions.some(
+      (tx) => tx.tx_type === "EXPENSE" && tx.category === account.name
+    );
+    if (hasEntries) {
+      showToast("This account has entries. Rename it instead.", "error");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Delete expense account "${account.name}"?`
+    );
+    if (!confirmed) return;
+
+    setSubmitting(true);
+    try {
+      const { error } = await supabase
+        .from("expense_accounts")
+        .delete()
+        .eq("id", account.id);
+      if (error) throw error;
+
+      if (editingAccount?.id === account.id) {
+        setEditingAccount(null);
+        setNewAccountName("");
+        setNewAccountDefault("0");
+      }
+      await fetchAllData();
+      showToast(`Deleted "${account.name}" expense account.`);
+    } catch (err) {
+      showToast(
+        formatSupabaseError(err, "Could not delete expense account."),
+        "error"
+      );
     } finally {
       setSubmitting(false);
     }
@@ -891,7 +1039,7 @@ export default function FurqanClothApp() {
       closeModal();
       showToast("All transactions reset. 400,000 PKR capital restored.");
     } catch (err) {
-      showToast(err?.message || "Failed to reset data.", "error");
+      showToast(formatSupabaseError(err, "Failed to reset data."), "error");
     } finally {
       setSubmitting(false);
     }
@@ -1214,14 +1362,14 @@ export default function FurqanClothApp() {
             </button>
           </section>
 
-          {/* 1-Tap Monthly Shop Bills + Admin Quick Actions */}
+          {/* 1-Tap Monthly Shop Bills + Quick Actions */}
           <section className="rounded-2xl bg-white border border-slate-200 p-3.5 shadow-xs space-y-2.5">
             <div className="flex items-center justify-between gap-2 flex-wrap">
               <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
                 1-Tap Monthly Shop Bills
               </span>
-              {isAdmin && (
-                <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-1.5">
+                {isAdmin && (
                   <button
                     type="button"
                     onClick={() => openCapitalModal()}
@@ -1230,51 +1378,83 @@ export default function FurqanClothApp() {
                     <PlusCircle className="w-3.5 h-3.5" />
                     Add Capital
                   </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditingAccount(null);
+                    setNewAccountName("");
+                    setNewAccountDefault("0");
+                    setActiveModal("ACCOUNT");
+                  }}
+                  className="inline-flex items-center gap-1 text-xs font-bold text-slate-800 bg-slate-100 hover:bg-slate-200 px-2.5 py-1 rounded-lg transition-colors"
+                >
+                  <PlusCircle className="w-3.5 h-3.5" />
+                  Expense Account
+                </button>
+              </div>
+            </div>
+
+            {(() => {
+              const rentAcc = expenseAccounts.find(
+                (a) => a.name === "Shop Rent"
+              );
+              const elecAcc = expenseAccounts.find(
+                (a) => a.name === "Electricity Bill"
+              );
+              const rentDefault = rentAcc
+                ? Number(rentAcc.default_amount) > 0
+                  ? Number(rentAcc.default_amount)
+                  : ""
+                : 2500;
+              const elecDefault = elecAcc
+                ? Number(elecAcc.default_amount) > 0
+                  ? Number(elecAcc.default_amount)
+                  : ""
+                : "";
+
+              return (
+                <div className="grid grid-cols-2 gap-2.5">
                   <button
                     type="button"
-                    onClick={() => setActiveModal("ACCOUNT")}
-                    className="inline-flex items-center gap-1 text-xs font-bold text-slate-800 bg-slate-100 hover:bg-slate-200 px-2.5 py-1 rounded-lg transition-colors"
+                    onClick={() => openExpenseModal("Shop Rent", rentDefault)}
+                    className="flex items-center gap-2.5 p-3 rounded-xl bg-rose-50 hover:bg-rose-100 border border-rose-200 text-left transition-colors active:scale-[0.99]"
                   >
-                    <PlusCircle className="w-3.5 h-3.5" />
-                    Expense Account
+                    <div className="w-9 h-9 rounded-xl bg-rose-200/70 text-rose-800 flex items-center justify-center shrink-0">
+                      <Building2 className="w-4 h-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold text-rose-900 truncate">
+                        {rentDefault !== ""
+                          ? `Rent (${Number(rentDefault).toLocaleString("en-PK")} PKR)`
+                          : "Shop Rent"}
+                      </div>
+                      <div className="text-[11px] text-rose-700">1-Tap Entry</div>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      openExpenseModal("Electricity Bill", elecDefault)
+                    }
+                    className="flex items-center gap-2.5 p-3 rounded-xl bg-rose-50 hover:bg-rose-100 border border-rose-200 text-left transition-colors active:scale-[0.99]"
+                  >
+                    <div className="w-9 h-9 rounded-xl bg-rose-200/70 text-rose-800 flex items-center justify-center shrink-0">
+                      <Zap className="w-4 h-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold text-rose-900 truncate">
+                        {elecDefault !== ""
+                          ? `Electricity (${Number(elecDefault).toLocaleString("en-PK")} PKR)`
+                          : "Electricity Bill"}
+                      </div>
+                      <div className="text-[11px] text-rose-700">Quick Entry</div>
+                    </div>
                   </button>
                 </div>
-              )}
-            </div>
-
-            <div className="grid grid-cols-2 gap-2.5">
-              <button
-                type="button"
-                onClick={() => openExpenseModal("Shop Rent", 2500)}
-                className="flex items-center gap-2.5 p-3 rounded-xl bg-rose-50 hover:bg-rose-100 border border-rose-200 text-left transition-colors active:scale-[0.99]"
-              >
-                <div className="w-9 h-9 rounded-xl bg-rose-200/70 text-rose-800 flex items-center justify-center shrink-0">
-                  <Building2 className="w-4 h-4" />
-                </div>
-                <div className="min-w-0">
-                  <div className="text-xs font-bold text-rose-900 truncate">
-                    Rent (2,500 PKR)
-                  </div>
-                  <div className="text-[11px] text-rose-700">1-Tap Entry</div>
-                </div>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => openExpenseModal("Electricity Bill", "")}
-                className="flex items-center gap-2.5 p-3 rounded-xl bg-rose-50 hover:bg-rose-100 border border-rose-200 text-left transition-colors active:scale-[0.99]"
-              >
-                <div className="w-9 h-9 rounded-xl bg-rose-200/70 text-rose-800 flex items-center justify-center shrink-0">
-                  <Zap className="w-4 h-4" />
-                </div>
-                <div className="min-w-0">
-                  <div className="text-xs font-bold text-rose-900 truncate">
-                    Electricity Bill
-                  </div>
-                  <div className="text-[11px] text-rose-700">Quick Entry</div>
-                </div>
-              </button>
-            </div>
+              );
+            })()}
           </section>
 
           {/* Export & Share Reports Bar */}
@@ -2080,14 +2260,16 @@ export default function FurqanClothApp() {
         </div>
       )}
 
-      {/* 5. ADD EXPENSE ACCOUNT MODAL (ADMIN ONLY) */}
-      {activeModal === "ACCOUNT" && isAdmin && (
+      {/* 5. ADD / EDIT EXPENSE ACCOUNT MODAL (ADMIN & STAFF; DELETE ADMIN ONLY) */}
+      {activeModal === "ACCOUNT" && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4">
-          <div className="w-full max-w-md bg-white rounded-t-3xl sm:rounded-3xl shadow-2xl overflow-hidden">
+          <div className="w-full max-w-md bg-white rounded-t-3xl sm:rounded-3xl shadow-2xl overflow-hidden max-h-[92vh] overflow-y-auto">
             <div className="flex items-center justify-between px-5 py-4 bg-slate-900 text-white">
               <h2 className="font-bold text-base flex items-center gap-2">
                 <PlusCircle className="w-5 h-5 text-emerald-400" />
-                Add Custom Expense Account
+                {editingAccount
+                  ? "Edit Expense Account"
+                  : "Add Custom Expense Account"}
               </h2>
               <button
                 type="button"
@@ -2106,11 +2288,27 @@ export default function FurqanClothApp() {
                 <input
                   type="text"
                   required
+                  readOnly={Boolean(
+                    editingAccount &&
+                      PROTECTED_EXPENSE_ACCOUNTS.has(editingAccount.name)
+                  )}
                   placeholder="e.g. Market Watchman Fee"
                   value={newAccountName}
                   onChange={(e) => setNewAccountName(e.target.value)}
-                  className="w-full px-3 py-2.5 rounded-xl border border-slate-300 text-sm font-medium focus:ring-2 focus:ring-slate-900 focus:outline-none"
+                  className={`w-full px-3 py-2.5 rounded-xl border border-slate-300 text-sm font-medium focus:ring-2 focus:ring-slate-900 focus:outline-none ${
+                    editingAccount &&
+                    PROTECTED_EXPENSE_ACCOUNTS.has(editingAccount.name)
+                      ? "bg-slate-100 text-slate-500 cursor-not-allowed"
+                      : ""
+                  }`}
                 />
+                {editingAccount &&
+                  PROTECTED_EXPENSE_ACCOUNTS.has(editingAccount.name) && (
+                    <p className="mt-1 text-[11px] text-slate-500">
+                      Used by 1-tap. Name is locked, but the default amount can be
+                      updated.
+                    </p>
+                  )}
               </div>
 
               <div>
@@ -2128,14 +2326,107 @@ export default function FurqanClothApp() {
                 />
               </div>
 
-              <button
-                type="submit"
-                disabled={submitting}
-                className="w-full py-3.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-sm shadow-md disabled:opacity-60"
-              >
-                {submitting ? "Adding..." : "Create Expense Account"}
-              </button>
+              <div className="flex items-center gap-2">
+                {editingAccount && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditingAccount(null);
+                      setNewAccountName("");
+                      setNewAccountDefault("0");
+                    }}
+                    className="px-4 py-3.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-sm"
+                  >
+                    Cancel
+                  </button>
+                )}
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="flex-1 py-3.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-sm shadow-md disabled:opacity-60"
+                >
+                  {submitting
+                    ? editingAccount
+                      ? "Updating..."
+                      : "Adding..."
+                    : editingAccount
+                    ? "Update Expense Account"
+                    : "Create Expense Account"}
+                </button>
+              </div>
             </form>
+
+            {/* Manage Expense Accounts List */}
+            <div className="px-5 pb-5 pt-2 border-t border-slate-200 space-y-2">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                Manage Expense Accounts ({expenseAccounts.length})
+              </h3>
+              <div className="space-y-1.5 max-h-56 overflow-y-auto pr-0.5">
+                {expenseAccounts.map((acc) => {
+                  const isProtected = PROTECTED_EXPENSE_ACCOUNTS.has(acc.name);
+                  return (
+                    <div
+                      key={acc.id || acc.name}
+                      className={`flex items-center justify-between gap-2 px-3 py-2 rounded-xl border text-xs ${
+                        editingAccount?.id && editingAccount.id === acc.id
+                          ? "bg-slate-100 border-slate-400"
+                          : "bg-slate-50 border-slate-200"
+                      }`}
+                    >
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="font-bold text-slate-800 truncate">
+                            {acc.name}
+                          </span>
+                          {isProtected && (
+                            <span className="px-1.5 py-0.5 rounded bg-slate-200/80 text-slate-600 text-[10px] font-semibold">
+                              Used by 1-tap
+                            </span>
+                          )}
+                        </div>
+                        {Number(acc.default_amount) > 0 && (
+                          <div className="text-[11px] text-slate-500">
+                            Default: {formatPKR(acc.default_amount)}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-1 shrink-0">
+                        {acc.id && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditingAccount(acc);
+                              setNewAccountName(acc.name);
+                              setNewAccountDefault(
+                                String(Number(acc.default_amount) || 0)
+                              );
+                            }}
+                            title="Edit Expense Account"
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 text-[11px] font-semibold"
+                          >
+                            <Pencil className="w-3 h-3" />
+                            Edit
+                          </button>
+                        )}
+                        {isAdmin && acc.id && !isProtected && (
+                          <button
+                            type="button"
+                            disabled={submitting}
+                            onClick={() => handleDeleteExpenseAccount(acc)}
+                            title="Delete Expense Account"
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white hover:bg-rose-50 border border-rose-200 text-rose-700 text-[11px] font-semibold disabled:opacity-50"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            Delete
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           </div>
         </div>
       )}

@@ -93,8 +93,8 @@ WHERE NOT EXISTS (
 );
 
 -- ----------------------------------------------------------------------------
--- 4. Access Permissions (PIN login is handled at app layer via app_users)
+-- 4. Row Level Security (RLS)
+--    RLS and ADMIN/STAFF policies are enforced by:
+--      supabase/migrations/001_rls_policies.sql
+--    Run that migration after this schema script. Do NOT disable RLS here.
 -- ----------------------------------------------------------------------------
-ALTER TABLE public.app_users DISABLE ROW LEVEL SECURITY;
-ALTER TABLE public.expense_accounts DISABLE ROW LEVEL SECURITY;
-ALTER TABLE public.transactions DISABLE ROW LEVEL SECURITY;
