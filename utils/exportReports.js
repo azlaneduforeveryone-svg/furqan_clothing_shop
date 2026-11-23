@@ -1,12 +1,13 @@
 import * as XLSX from "xlsx";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
+import { computePalletAndStockMetrics } from "./palletMetrics";
 
-function formatNumber(num) {
+function formatNumber(num, decimals = 2) {
   const value = Number(num) || 0;
   return value.toLocaleString("en-PK", {
     minimumFractionDigits: 0,
-    maximumFractionDigits: 2,
+    maximumFractionDigits: decimals,
   });
 }
 
@@ -35,18 +36,22 @@ function buildLedgerWithRunningBalance(transactions) {
     const amount = Number(tx.total_amount) || 0;
     running += amount;
     const pieces = Number(tx.pieces_count) || 0;
-    const bundlePrice = Number(tx.bundle_price) || 0;
+    const palletPrice = Number(tx.bundle_price) || 0;
     const transportCost = Number(tx.transport_cost) || 0;
     const labourCost = Number(tx.labour_other_cost) || 0;
     const perPiece =
-      Number(tx.per_piece_cost) ||
-      (pieces > 0 ? (bundlePrice + transportCost + labourCost) / pieces : 0);
+      tx.tx_type === "PURCHASE"
+        ? Number(tx.per_piece_cost) ||
+          (pieces > 0 ? (palletPrice + transportCost + labourCost) / pieces : 0)
+        : tx.tx_type === "SALE" && pieces > 0
+        ? Math.abs(amount) / pieces
+        : 0;
 
     return {
       ...tx,
       amount,
       pieces,
-      bundlePrice,
+      palletPrice,
       transportCost,
       labourCost,
       perPiece,
@@ -58,12 +63,13 @@ function buildLedgerWithRunningBalance(transactions) {
 /**
  * Exports a 3-sheet Excel workbook:
  * 1. Cash Ledger (with running balance)
- * 2. Cloth Costing
+ * 2. Pallets & Stock (summary figures + pallet list)
  * 3. Summary
  */
-export function exportToExcel({ transactions, clothCosting, summary }) {
+export function exportToExcel({ transactions, summary }) {
   const workbook = XLSX.utils.book_new();
   const ledgerRows = buildLedgerWithRunningBalance(transactions);
+  const metrics = computePalletAndStockMetrics(transactions);
 
   // Sheet 1: Cash Ledger
   const ledgerSheetData = ledgerRows.map((row) => ({
@@ -71,12 +77,17 @@ export function exportToExcel({ transactions, clothCosting, summary }) {
     Type: row.tx_type,
     Category: row.category,
     Description: row.description || "",
-    Pieces: row.tx_type === "PURCHASE" ? row.pieces : "",
-    "Bundle Price (PKR)": row.tx_type === "PURCHASE" ? row.bundlePrice : "",
+    Pieces:
+      row.tx_type === "PURCHASE" || (row.tx_type === "SALE" && row.pieces > 0)
+        ? row.pieces
+        : "",
+    "Pallet Price (PKR)": row.tx_type === "PURCHASE" ? row.palletPrice : "",
     "Transport (PKR)": row.tx_type === "PURCHASE" ? row.transportCost : "",
     "Labour/Other (PKR)": row.tx_type === "PURCHASE" ? row.labourCost : "",
-    "Per-Piece Cost (PKR)":
-      row.tx_type === "PURCHASE" ? Number(row.perPiece.toFixed(2)) : "",
+    "Per-Piece (PKR)":
+      row.tx_type === "PURCHASE" || (row.tx_type === "SALE" && row.pieces > 0)
+        ? Number(row.perPiece.toFixed(2))
+        : "",
     "Cash Flow (PKR)": row.amount,
     "Running Balance (PKR)": row.runningBalance,
   }));
@@ -89,46 +100,94 @@ export function exportToExcel({ transactions, clothCosting, summary }) {
   ledgerSheet["!cols"] = [
     { wch: 12 },
     { wch: 11 },
-    { wch: 24 },
+    { wch: 20 },
     { wch: 28 },
     { wch: 9 },
     { wch: 16 },
     { wch: 15 },
     { wch: 16 },
-    { wch: 18 },
+    { wch: 16 },
     { wch: 16 },
     { wch: 20 },
   ];
   XLSX.utils.book_append_sheet(workbook, ledgerSheet, "Cash Ledger");
 
-  // Sheet 2: Cloth Costing
-  const costingSheetData = clothCosting.map((item) => ({
-    "Cloth Type": item.clothType,
-    "Total Bundles": item.bundlesCount,
-    "Total Pieces": item.totalPieces,
-    "Bundle Price (PKR)": item.totalBundlePrice,
-    "Transport (PKR)": item.totalTransport,
-    "Labour / Other (PKR)": item.totalLabour,
-    "Total Landed Spend (PKR)": item.totalLandedSpend,
-    "Avg Cost / Piece (PKR)": Number(item.avgPerPiece.toFixed(2)),
-  }));
-
-  const costingSheet = XLSX.utils.json_to_sheet(
-    costingSheetData.length > 0
-      ? costingSheetData
-      : [{ Info: "No bundle purchases recorded yet." }]
-  );
-  costingSheet["!cols"] = [
-    { wch: 26 },
-    { wch: 14 },
-    { wch: 14 },
-    { wch: 18 },
-    { wch: 16 },
-    { wch: 18 },
-    { wch: 22 },
-    { wch: 20 },
+  // Sheet 2: Pallets & Stock (Summary + Pallet List)
+  const stockSummaryRows = [
+    ["Pallets & Stock Summary", ""],
+    ["Pallets Bought", metrics.palletsBought],
+    ["Pieces Bought", metrics.piecesBought],
+    ["Pieces Sold", metrics.piecesSold],
+    ["Pieces in Stock", metrics.piecesInStock],
+    [
+      "Average Landed Cost / Piece (PKR)",
+      Number(metrics.avgLandedCostPerPiece.toFixed(2)),
+    ],
+    [
+      "Average Sale Price / Piece (PKR)",
+      Number(metrics.avgSalePricePerPiece.toFixed(2)),
+    ],
+    [
+      "Estimated Gross Profit - Estimate (average cost) (PKR)",
+      Number(metrics.estimatedGrossProfit.toFixed(2)),
+    ],
+    [
+      "Estimated Stock Value - Estimate (average cost) (PKR)",
+      Number(metrics.estimatedStockValue.toFixed(2)),
+    ],
   ];
-  XLSX.utils.book_append_sheet(workbook, costingSheet, "Cloth Costing");
+
+  if (metrics.excludedLegacySalesCount > 0) {
+    stockSummaryRows.push([
+      "Note",
+      `${metrics.excludedLegacySalesCount} legacy sale(s) with 0 pieces excluded from per-piece averages.`,
+    ]);
+  }
+
+  stockSummaryRows.push([]);
+  stockSummaryRows.push([
+    "Pallet #",
+    "Date",
+    "Supplier / Grade",
+    "Pieces",
+    "Pallet Price (PKR)",
+    "Transport (PKR)",
+    "Labour / Loading (PKR)",
+    "Landed Cost (PKR)",
+    "Cost / Piece (PKR)",
+  ]);
+
+  if (metrics.pallets.length > 0) {
+    for (const p of metrics.pallets) {
+      stockSummaryRows.push([
+        p.palletNumber,
+        p.txDate,
+        p.supplierGrade,
+        p.pieces,
+        p.palletPrice,
+        p.transportCost,
+        p.labourCost,
+        p.landedCost,
+        Number(p.costPerPiece.toFixed(2)),
+      ]);
+    }
+  } else {
+    stockSummaryRows.push(["No pallet purchases recorded yet."]);
+  }
+
+  const palletsSheet = XLSX.utils.aoa_to_sheet(stockSummaryRows);
+  palletsSheet["!cols"] = [
+    { wch: 48 },
+    { wch: 14 },
+    { wch: 24 },
+    { wch: 10 },
+    { wch: 18 },
+    { wch: 15 },
+    { wch: 20 },
+    { wch: 18 },
+    { wch: 18 },
+  ];
+  XLSX.utils.book_append_sheet(workbook, palletsSheet, "Pallets & Stock");
 
   // Sheet 3: Summary
   const summarySheetData = [
@@ -137,7 +196,7 @@ export function exportToExcel({ transactions, clothCosting, summary }) {
     { Metric: "Report Generated", Value: new Date().toLocaleString("en-PK") },
     { Metric: "Opening Capital (PKR)", Value: summary.openingCapital },
     { Metric: "Total Cash Sales (+PKR)", Value: summary.totalSales },
-    { Metric: "Total Bundle Purchases (-PKR)", Value: -summary.totalPurchases },
+    { Metric: "Total Pallet Purchases (-PKR)", Value: -summary.totalPurchases },
     { Metric: "Total Shop Expenses (-PKR)", Value: -summary.totalExpenses },
     { Metric: "Total Cash Spent (-PKR)", Value: -summary.totalSpent },
     { Metric: "Available Cash in Hand (PKR)", Value: summary.cashInHand },
@@ -156,9 +215,10 @@ export function exportToExcel({ transactions, clothCosting, summary }) {
 /**
  * Generates a color-coded PDF statement (green rows for sales, red rows for spending).
  */
-function createPDFDocument({ transactions, clothCosting, summary }) {
+function createPDFDocument({ transactions, summary }) {
   const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
   const ledgerRows = buildLedgerWithRunningBalance(transactions);
+  const metrics = computePalletAndStockMetrics(transactions);
   const generatedAt = new Date().toLocaleString("en-PK");
 
   // Header bar
@@ -173,7 +233,11 @@ function createPDFDocument({ transactions, clothCosting, summary }) {
   doc.setFont("helvetica", "normal");
   doc.setFontSize(9.5);
   doc.setTextColor(203, 213, 225);
-  doc.text(`Cash-Basis Financial Statement (PKR)  |  Generated: ${generatedAt}`, 14, 21);
+  doc.text(
+    `Cash-Basis Financial Statement (PKR)  |  Generated: ${generatedAt}`,
+    14,
+    21
+  );
 
   // Summary boxes
   const boxY = 34;
@@ -224,6 +288,8 @@ function createPDFDocument({ transactions, clothCosting, summary }) {
   const tableBody = ledgerRows.map((row) => {
     let details = row.category;
     if (row.tx_type === "PURCHASE") {
+      details += ` (${row.pieces} pcs @ PKR ${formatNumber(row.perPiece)}/pc)`;
+    } else if (row.tx_type === "SALE" && row.pieces > 0) {
       details += ` (${row.pieces} pcs @ PKR ${formatNumber(row.perPiece)}/pc)`;
     }
     if (row.description) {
@@ -285,44 +351,96 @@ function createPDFDocument({ transactions, clothCosting, summary }) {
         data.cell.styles.fillColor = [255, 241, 242]; // rose-50
         data.cell.styles.textColor = [159, 18, 57]; // rose-800
       } else if (rowData.tx_type === "CAPITAL") {
-        data.cell.styles.fillColor = [241, 245, 249]; // slate-100
-        data.cell.styles.textColor = [30, 41, 59]; // slate-800
+        data.cell.styles.fillColor = [238, 242, 255]; // indigo-50
+        data.cell.styles.textColor = [49, 46, 129]; // indigo-900
       }
     },
   });
 
-  // Cloth Costing Summary Table (if bundles exist)
-  if (clothCosting.length > 0) {
-    const nextY = (doc.lastAutoTable?.finalY || 120) + 10;
-    const startY = nextY > 250 ? (doc.addPage(), 20) : nextY;
+  // Pallets & Stock Summary Section
+  const afterLedgerY = (doc.lastAutoTable?.finalY || 120) + 10;
+  const sectionStartY = afterLedgerY > 235 ? (doc.addPage(), 20) : afterLedgerY;
+
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(11);
+  doc.setTextColor(15, 23, 42);
+  doc.text("Pallets & Stock Summary", 14, sectionStartY);
+
+  autoTable(doc, {
+    startY: sectionStartY + 4,
+    head: [["Metric", "Value"]],
+    body: [
+      ["Pallets Bought", String(metrics.palletsBought)],
+      ["Pieces Bought", formatNumber(metrics.piecesBought, 0)],
+      ["Pieces Sold", formatNumber(metrics.piecesSold, 0)],
+      ["Pieces in Stock", formatNumber(metrics.piecesInStock, 0)],
+      [
+        "Average Landed Cost / Piece",
+        `PKR ${formatNumber(metrics.avgLandedCostPerPiece)}`,
+      ],
+      [
+        "Average Sale Price / Piece",
+        `PKR ${formatNumber(metrics.avgSalePricePerPiece)}`,
+      ],
+      [
+        "Estimated Gross Profit — Estimate (average cost)",
+        `PKR ${formatNumber(metrics.estimatedGrossProfit)}`,
+      ],
+      [
+        "Estimated Stock Value — Estimate (average cost)",
+        `PKR ${formatNumber(metrics.estimatedStockValue)}`,
+      ],
+    ],
+    theme: "grid",
+    styles: {
+      fontSize: 8.5,
+      cellPadding: 2.5,
+      lineColor: [226, 232, 240],
+    },
+    headStyles: {
+      fillColor: [30, 41, 59],
+      textColor: [255, 255, 255],
+      fontStyle: "bold",
+    },
+    columnStyles: {
+      0: { cellWidth: 122 },
+      1: { cellWidth: 60, halign: "right", fontStyle: "bold" },
+    },
+  });
+
+  if (metrics.pallets.length > 0) {
+    const nextY = (doc.lastAutoTable?.finalY || 180) + 8;
+    const palletsStartY = nextY > 245 ? (doc.addPage(), 20) : nextY;
 
     doc.setFont("helvetica", "bold");
     doc.setFontSize(11);
     doc.setTextColor(15, 23, 42);
-    doc.text("Cloth Bundle Costing Summary", 14, startY);
+    doc.text("Pallet Purchases", 14, palletsStartY);
 
     autoTable(doc, {
-      startY: startY + 4,
+      startY: palletsStartY + 4,
       head: [
         [
-          "Cloth Type",
-          "Bundles",
+          "Pallet #",
+          "Date",
+          "Supplier / Grade",
           "Pieces",
-          "Total Landed (PKR)",
-          "Avg Cost / Piece",
+          "Landed Cost (PKR)",
+          "Cost / Piece",
         ],
       ],
-      body: clothCosting.map((c) => [
-        c.clothType,
-        String(c.bundlesCount),
-        String(c.totalPieces),
-        formatNumber(c.totalLandedSpend),
-        `PKR ${formatNumber(c.avgPerPiece)}`,
+      body: metrics.pallets.map((p) => [
+        p.palletNumber,
+        p.txDate,
+        p.supplierGrade || "-",
+        String(p.pieces),
+        formatNumber(p.landedCost),
+        `PKR ${formatNumber(p.costPerPiece)}`,
       ]),
       theme: "grid",
       styles: {
         fontSize: 8.5,
-        cellPadding: 2.8,
+        cellPadding: 2.6,
         lineColor: [226, 232, 240],
       },
       headStyles: {
@@ -331,10 +449,9 @@ function createPDFDocument({ transactions, clothCosting, summary }) {
         fontStyle: "bold",
       },
       columnStyles: {
-        1: { halign: "center" },
-        2: { halign: "center" },
-        3: { halign: "right" },
-        4: { halign: "right", fontStyle: "bold" },
+        3: { halign: "center" },
+        4: { halign: "right" },
+        5: { halign: "right", fontStyle: "bold" },
       },
     });
   }
@@ -342,15 +459,15 @@ function createPDFDocument({ transactions, clothCosting, summary }) {
   return doc;
 }
 
-export function exportToPDF({ transactions, clothCosting, summary }) {
-  const doc = createPDFDocument({ transactions, clothCosting, summary });
+export function exportToPDF({ transactions, summary }) {
+  const doc = createPDFDocument({ transactions, summary });
   const filename = `Furqan_Cloth_Statement_${getTodayStamp()}.pdf`;
   doc.save(filename);
   return filename;
 }
 
-export async function sharePDFReport({ transactions, clothCosting, summary }) {
-  const doc = createPDFDocument({ transactions, clothCosting, summary });
+export async function sharePDFReport({ transactions, summary }) {
+  const doc = createPDFDocument({ transactions, summary });
   const filename = `Furqan_Cloth_Statement_${getTodayStamp()}.pdf`;
   const pdfBlob = doc.output("blob");
   const pdfFile = new File([pdfBlob], filename, { type: "application/pdf" });

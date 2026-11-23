@@ -47,20 +47,12 @@ import {
   exportToPDF,
   sharePDFReport,
 } from "@/utils/exportReports";
+import {
+  computePalletAndStockMetrics,
+  getNextPalletCode,
+} from "@/utils/palletMetrics";
 
 const SESSION_STORAGE_KEY = "furqan_cloth_session_v1";
-
-const CLOTH_TYPES = [
-  "Men Jeans / Denim",
-  "Men T-Shirts & Polos",
-  "Men Dress Shirts",
-  "Winter Jackets & Hoodies",
-  "Ladies Kurtis & Suits",
-  "Ladies Shawls & Dupattas",
-  "Kids Mix Bundle",
-  "Bed Sheets & Blankets",
-  "Mixed Grade-A Bundle",
-];
 
 const DEFAULT_EXPENSE_ACCOUNTS = [
   { name: "Shop Rent", default_amount: 2500 },
@@ -137,7 +129,7 @@ export default function FurqanClothApp() {
   const [dataError, setDataError] = useState("");
 
   // UI state
-  const [activeTab, setActiveTab] = useState("ledger"); // 'ledger' | 'costing'
+  const [activeTab, setActiveTab] = useState("ledger"); // 'ledger' | 'pallets'
   const [ledgerFilter, setLedgerFilter] = useState("ALL"); // 'ALL' | 'SALE' | 'PURCHASE' | 'EXPENSE'
   const [toast, setToast] = useState(null);
 
@@ -152,20 +144,22 @@ export default function FurqanClothApp() {
   const [capitalAmount, setCapitalAmount] = useState("");
   const [capitalNotes, setCapitalNotes] = useState("");
 
-  // Sale form state
+  // Daily Sale form state
   const [saleDate, setSaleDate] = useState(getTodayISO());
-  const [saleCategory, setSaleCategory] = useState("Daily Cash Sales");
+  const [salePiecesCount, setSalePiecesCount] = useState("");
   const [saleAmount, setSaleAmount] = useState("");
   const [saleNotes, setSaleNotes] = useState("");
+  const [confirmDuplicateSaleDate, setConfirmDuplicateSaleDate] =
+    useState(false);
 
-  // Bundle Purchase form state
+  // Pallet Purchase form state
   const [purchaseDate, setPurchaseDate] = useState(getTodayISO());
-  const [clothType, setClothType] = useState(CLOTH_TYPES[0]);
+  const [palletNumber, setPalletNumber] = useState("Pallet P-001");
   const [piecesCount, setPiecesCount] = useState("");
-  const [bundlePrice, setBundlePrice] = useState("");
+  const [palletPrice, setPalletPrice] = useState("");
   const [transportCost, setTransportCost] = useState("0");
   const [labourCost, setLabourCost] = useState("0");
-  const [purchaseNotes, setPurchaseNotes] = useState("");
+  const [supplierGrade, setSupplierGrade] = useState("");
 
   // Expense form state
   const [expenseDate, setExpenseDate] = useState(getTodayISO());
@@ -430,46 +424,11 @@ export default function FurqanClothApp() {
       .slice(-10);
   }, [transactions]);
 
-  // Cloth Costing aggregation by Cloth Type
-  const clothCosting = useMemo(() => {
-    const groups = new Map();
-
-    for (const tx of transactions) {
-      if (tx.tx_type !== "PURCHASE") continue;
-      const key = tx.category || "Uncategorized Bundle";
-      if (!groups.has(key)) {
-        groups.set(key, {
-          clothType: key,
-          bundlesCount: 0,
-          totalPieces: 0,
-          totalBundlePrice: 0,
-          totalTransport: 0,
-          totalLabour: 0,
-          totalLandedSpend: 0,
-          avgPerPiece: 0,
-        });
-      }
-      const g = groups.get(key);
-      const bPrice = Number(tx.bundle_price) || 0;
-      const tCost = Number(tx.transport_cost) || 0;
-      const lCost = Number(tx.labour_other_cost) || 0;
-      const landed = Math.abs(Number(tx.total_amount) || bPrice + tCost + lCost);
-
-      g.bundlesCount += 1;
-      g.totalPieces += Number(tx.pieces_count) || 0;
-      g.totalBundlePrice += bPrice;
-      g.totalTransport += tCost;
-      g.totalLabour += lCost;
-      g.totalLandedSpend += landed;
-    }
-
-    return Array.from(groups.values())
-      .map((g) => ({
-        ...g,
-        avgPerPiece: g.totalPieces > 0 ? g.totalLandedSpend / g.totalPieces : 0,
-      }))
-      .sort((a, b) => b.totalLandedSpend - a.totalLandedSpend);
-  }, [transactions]);
+  // Pallets & Stock metrics (shared with Excel & PDF exports)
+  const palletMetrics = useMemo(
+    () => computePalletAndStockMetrics(transactions),
+    [transactions]
+  );
 
   // Filtered ledger list
   const filteredTransactions = useMemo(() => {
@@ -477,16 +436,35 @@ export default function FurqanClothApp() {
     return transactions.filter((tx) => tx.tx_type === ledgerFilter);
   }, [transactions, ledgerFilter]);
 
-  // Live bundle landed preview
-  const bundlePreview = useMemo(() => {
-    const pieces = parseInt(piecesCount, 10) || 0;
-    const bPrice = parseAmount(bundlePrice);
+  // Check if a SALE already exists for the selected saleDate (when adding a new sale)
+  const hasExistingSaleForDate = useMemo(() => {
+    if (editingTx) return false;
+    return transactions.some(
+      (tx) => tx.tx_type === "SALE" && tx.tx_date === saleDate
+    );
+  }, [transactions, saleDate, editingTx]);
+
+  // Live daily sale average price per piece
+  const salePricePerPiece = useMemo(() => {
+    const trimmedPieces = String(salePiecesCount).trim();
+    if (!/^\d+$/.test(trimmedPieces)) return null;
+    const pieces = parseInt(trimmedPieces, 10);
+    const total = parseAmount(saleAmount);
+    if (pieces < 1 || total <= 0) return null;
+    return total / pieces;
+  }, [salePiecesCount, saleAmount]);
+
+  // Live pallet landed preview
+  const palletPreview = useMemo(() => {
+    const trimmedPieces = String(piecesCount).trim();
+    const pieces = /^\d+$/.test(trimmedPieces) ? parseInt(trimmedPieces, 10) : 0;
+    const pPrice = parseAmount(palletPrice);
     const tCost = parseAmount(transportCost);
     const lCost = parseAmount(labourCost);
-    const totalOutflow = bPrice + tCost + lCost;
+    const totalOutflow = pPrice + tCost + lCost;
     const perPiece = pieces > 0 ? totalOutflow / pieces : 0;
-    return { pieces, bPrice, tCost, lCost, totalOutflow, perPiece };
-  }, [piecesCount, bundlePrice, transportCost, labourCost]);
+    return { pieces, pPrice, tCost, lCost, totalOutflow, perPiece };
+  }, [piecesCount, palletPrice, transportCost, labourCost]);
 
   // Email & Password Login Handler (Supabase Auth)
   const handleLogin = async (e) => {
@@ -575,14 +553,17 @@ export default function FurqanClothApp() {
   const openSaleModal = (tx = null) => {
     if (tx?.tx_type === "CAPITAL" && !isAdmin) return;
     setEditingTx(tx);
+    setConfirmDuplicateSaleDate(false);
     if (tx) {
       setSaleDate(tx.tx_date || getTodayISO());
-      setSaleCategory(tx.category || "Daily Cash Sales");
+      setSalePiecesCount(
+        Number(tx.pieces_count) > 0 ? String(tx.pieces_count) : ""
+      );
       setSaleAmount(String(Math.abs(Number(tx.total_amount) || 0)));
       setSaleNotes(tx.description || "");
     } else {
       setSaleDate(getTodayISO());
-      setSaleCategory("Daily Cash Sales");
+      setSalePiecesCount("");
       setSaleAmount("");
       setSaleNotes("");
     }
@@ -593,20 +574,20 @@ export default function FurqanClothApp() {
     setEditingTx(tx);
     if (tx) {
       setPurchaseDate(tx.tx_date || getTodayISO());
-      setClothType(tx.category || CLOTH_TYPES[0]);
+      setPalletNumber(tx.category || getNextPalletCode(transactions));
       setPiecesCount(String(tx.pieces_count || ""));
-      setBundlePrice(String(tx.bundle_price || ""));
+      setPalletPrice(String(tx.bundle_price || ""));
       setTransportCost(String(tx.transport_cost || "0"));
       setLabourCost(String(tx.labour_other_cost || "0"));
-      setPurchaseNotes(tx.description || "");
+      setSupplierGrade(tx.description || "");
     } else {
       setPurchaseDate(getTodayISO());
-      setClothType(CLOTH_TYPES[0]);
+      setPalletNumber(getNextPalletCode(transactions));
       setPiecesCount("");
-      setBundlePrice("");
+      setPalletPrice("");
       setTransportCost("0");
       setLabourCost("0");
-      setPurchaseNotes("");
+      setSupplierGrade("");
     }
     setActiveModal("PURCHASE");
   };
@@ -673,9 +654,10 @@ export default function FurqanClothApp() {
     setEditingAccount(null);
     setNewAccountName("");
     setNewAccountDefault("0");
+    setConfirmDuplicateSaleDate(false);
   };
 
-  // Save Sale (ADMIN or STAFF)
+  // Save Daily Sale (ADMIN or STAFF)
   const handleSaveSale = async (e) => {
     e.preventDefault();
     if (!supabase || !sessionUser) return;
@@ -687,14 +669,41 @@ export default function FurqanClothApp() {
       return;
     }
 
+    const allowBlankPieces = Boolean(
+      editingTx &&
+        editingTx.tx_type === "SALE" &&
+        Number(editingTx.pieces_count || 0) === 0
+    );
+    const trimmedPieces = String(salePiecesCount).trim();
+    let pieces = 0;
+
+    if (trimmedPieces === "") {
+      if (!allowBlankPieces) {
+        showToast("Enter pieces sold today (at least 1).", "error");
+        return;
+      }
+      pieces = 0;
+    } else if (!/^\d+$/.test(trimmedPieces) || parseInt(trimmedPieces, 10) < 1) {
+      showToast("Pieces sold must be a whole number (at least 1).", "error");
+      return;
+    } else {
+      pieces = parseInt(trimmedPieces, 10);
+    }
+
+    // Require second tap if a SALE already exists for this date (when adding new)
+    if (!editingTx && hasExistingSaleForDate && !confirmDuplicateSaleDate) {
+      setConfirmDuplicateSaleDate(true);
+      return;
+    }
+
     setSubmitting(true);
     try {
       const payload = {
         tx_date: saleDate,
         tx_type: editingTx?.tx_type === "CAPITAL" ? "CAPITAL" : "SALE",
-        category: saleCategory.trim() || "Daily Cash Sales",
+        category: editingTx ? editingTx.category || "Daily Sales" : "Daily Sales",
         description: saleNotes.trim(),
-        pieces_count: 0,
+        pieces_count: pieces,
         bundle_price: 0,
         transport_cost: 0,
         labour_other_cost: 0,
@@ -711,38 +720,44 @@ export default function FurqanClothApp() {
       if (error) throw error;
       await fetchAllData();
       closeModal();
-      showToast(editingTx ? "Entry updated." : "Cash sale recorded!");
+      showToast(editingTx ? "Daily sale updated." : "Daily sales recorded!");
     } catch (err) {
-      showToast(formatSupabaseError(err, "Could not save sale."), "error");
+      showToast(formatSupabaseError(err, "Could not save daily sale."), "error");
     } finally {
       setSubmitting(false);
     }
   };
 
-  // Save Bundle Purchase (ADMIN or STAFF)
+  // Save Pallet Purchase (ADMIN or STAFF)
   const handleSavePurchase = async (e) => {
     e.preventDefault();
     if (!supabase || !sessionUser) return;
 
-    const { pieces, bPrice, tCost, lCost, totalOutflow } = bundlePreview;
-    if (pieces <= 0) {
-      showToast("Enter the number of pieces in the bundle.", "error");
+    const trimmedPieces = String(piecesCount).trim();
+    if (!/^\d+$/.test(trimmedPieces) || parseInt(trimmedPieces, 10) < 1) {
+      showToast("Pieces in pallet must be a whole number (at least 1).", "error");
       return;
     }
+
+    const { pieces, pPrice, tCost, lCost, totalOutflow } = palletPreview;
     if (totalOutflow <= 0) {
-      showToast("Enter a valid bundle price.", "error");
+      showToast("Enter a valid pallet price.", "error");
       return;
     }
+
+    const targetCategory = editingTx
+      ? editingTx.category || palletNumber
+      : palletNumber;
 
     setSubmitting(true);
     try {
       const payload = {
         tx_date: purchaseDate,
         tx_type: "PURCHASE",
-        category: clothType,
-        description: purchaseNotes.trim(),
+        category: targetCategory,
+        description: supplierGrade.trim(),
         pieces_count: pieces,
-        bundle_price: bPrice,
+        bundle_price: pPrice,
         transport_cost: tCost,
         labour_other_cost: lCost,
         total_amount: -totalOutflow,
@@ -760,12 +775,12 @@ export default function FurqanClothApp() {
       closeModal();
       showToast(
         editingTx
-          ? "Bundle updated & per-piece cost recalculated."
-          : "Bundle purchase recorded!"
+          ? "Pallet updated & per-piece cost recalculated."
+          : "Pallet purchase recorded!"
       );
     } catch (err) {
       showToast(
-        formatSupabaseError(err, "Could not save bundle purchase."),
+        formatSupabaseError(err, "Could not save pallet purchase."),
         "error"
       );
     } finally {
@@ -1048,7 +1063,7 @@ export default function FurqanClothApp() {
   // Report Export Handlers
   const handleExportExcel = () => {
     try {
-      exportToExcel({ transactions, clothCosting, summary });
+      exportToExcel({ transactions, summary });
       showToast("Excel 3-sheet workbook downloaded!");
     } catch (err) {
       showToast(err?.message || "Excel export failed.", "error");
@@ -1057,7 +1072,7 @@ export default function FurqanClothApp() {
 
   const handleExportPDF = () => {
     try {
-      exportToPDF({ transactions, clothCosting, summary });
+      exportToPDF({ transactions, summary });
       showToast("Color-coded PDF statement downloaded!");
     } catch (err) {
       showToast(err?.message || "PDF export failed.", "error");
@@ -1068,7 +1083,6 @@ export default function FurqanClothApp() {
     try {
       const result = await sharePDFReport({
         transactions,
-        clothCosting,
         summary,
       });
       if (result.shared) {
@@ -1108,7 +1122,7 @@ export default function FurqanClothApp() {
               Furqan Used Cloth Business
             </h1>
             <p className="text-xs text-slate-400 mt-1">
-              Cash-Basis Accounting &amp; Bundle Costing (PKR)
+              Cash-Basis Accounting &amp; Pallet Costing (PKR)
             </p>
           </div>
 
@@ -1349,7 +1363,7 @@ export default function FurqanClothApp() {
               className="flex flex-col items-center justify-center gap-1.5 py-3.5 px-2 rounded-2xl bg-rose-600 hover:bg-rose-700 active:scale-[0.98] text-white font-bold text-xs shadow-sm transition-all"
             >
               <Package className="w-5 h-5" />
-              <span>Buy Bundle</span>
+              <span>Buy Pallet</span>
             </button>
 
             <button
@@ -1500,7 +1514,7 @@ export default function FurqanClothApp() {
             {chartData.length === 0 ? (
               <div className="h-44 flex flex-col items-center justify-center text-center text-xs text-slate-400 bg-slate-50 rounded-xl border border-dashed border-slate-200">
                 <BarChart3 className="w-7 h-7 mb-1.5 opacity-40" />
-                Record a sale, bundle, or expense to see the daily chart.
+                Record a sale, pallet, or expense to see the daily chart.
               </div>
             ) : (
               <div className="h-52 w-full">
@@ -1551,7 +1565,7 @@ export default function FurqanClothApp() {
             )}
           </section>
 
-          {/* Tabs: Daily Cash Ledger & Cloth Costing */}
+          {/* Tabs: Daily Cash Ledger & Pallets & Stock */}
           <section className="space-y-3">
             <div className="grid grid-cols-2 gap-1.5 p-1 rounded-2xl bg-slate-200/80">
               <button
@@ -1567,14 +1581,14 @@ export default function FurqanClothApp() {
               </button>
               <button
                 type="button"
-                onClick={() => setActiveTab("costing")}
+                onClick={() => setActiveTab("pallets")}
                 className={`py-2.5 rounded-xl text-xs font-bold transition-all ${
-                  activeTab === "costing"
+                  activeTab === "pallets"
                     ? "bg-white text-slate-900 shadow-xs"
                     : "text-slate-600 hover:text-slate-900"
                 }`}
               >
-                Cloth Costing ({clothCosting.length})
+                Pallets &amp; Stock ({palletMetrics.palletsBought})
               </button>
             </div>
 
@@ -1586,7 +1600,7 @@ export default function FurqanClothApp() {
                   {[
                     { id: "ALL", label: "All" },
                     { id: "SALE", label: "Sales" },
-                    { id: "PURCHASE", label: "Bundles" },
+                    { id: "PURCHASE", label: "Pallets" },
                     { id: "EXPENSE", label: "Expenses" },
                   ].map((f) => (
                     <button
@@ -1706,7 +1720,17 @@ export default function FurqanClothApp() {
                           </div>
                         </div>
 
-                        {/* Red Per-Piece Cost Badge & Breakdown for Bundle Purchases */}
+                        {/* Green Per-Piece Price Badge for Sales with pieces_count > 0 */}
+                        {isSale && pieces > 0 && (
+                          <div className="mt-2.5 pt-2.5 border-t border-emerald-200/80 flex flex-wrap items-center justify-between gap-2">
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-emerald-600 text-white text-[11px] font-bold shadow-xs">
+                              {pieces} pcs @{" "}
+                              {formatPKR(Math.abs(amt) / pieces, 2)}
+                            </span>
+                          </div>
+                        )}
+
+                        {/* Red Per-Piece Cost Badge & Breakdown for Pallet Purchases */}
                         {isPurchase && (
                           <div className="mt-2.5 pt-2.5 border-t border-rose-200/80 flex flex-wrap items-center justify-between gap-2">
                             <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-rose-600 text-white text-[11px] font-bold shadow-xs">
@@ -1714,7 +1738,7 @@ export default function FurqanClothApp() {
                               {formatPKR(perPiece, 2)} / piece
                             </span>
                             <span className="text-[11px] text-rose-800 font-medium">
-                              {pieces} pcs • Bundle{" "}
+                              {pieces} pcs • Pallet{" "}
                               {formatPKR(tx.bundle_price)} + Trans{" "}
                               {formatPKR(tx.transport_cost)} + Lab{" "}
                               {formatPKR(tx.labour_other_cost)}
@@ -1728,60 +1752,184 @@ export default function FurqanClothApp() {
               </div>
             )}
 
-            {/* TAB 2: CLOTH COSTING AGGREGATION */}
-            {activeTab === "costing" && (
-              <div className="space-y-2.5">
-                {clothCosting.length === 0 ? (
+            {/* TAB 2: PALLETS & STOCK */}
+            {activeTab === "pallets" && (
+              <div className="space-y-3">
+                {/* Negative Stock Warning */}
+                {palletMetrics.piecesInStock < 0 && (
+                  <div className="rounded-2xl bg-rose-50 border border-rose-300 p-3.5 text-xs font-bold text-rose-800">
+                    Pieces sold are more than pieces bought. Check entries.
+                  </div>
+                )}
+
+                {/* Summary Metric Cards */}
+                <div className="grid grid-cols-2 gap-2.5">
+                  <div className="rounded-2xl bg-white border border-slate-200 p-3.5 shadow-xs">
+                    <div className="text-[11px] font-semibold text-slate-500">
+                      Pallets Bought
+                    </div>
+                    <div className="mt-1 text-lg font-extrabold text-slate-900">
+                      {palletMetrics.palletsBought.toLocaleString("en-PK")}
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl bg-white border border-slate-200 p-3.5 shadow-xs">
+                    <div className="text-[11px] font-semibold text-slate-500">
+                      Pieces Bought
+                    </div>
+                    <div className="mt-1 text-lg font-extrabold text-slate-900">
+                      {palletMetrics.piecesBought.toLocaleString("en-PK")}
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl bg-white border border-slate-200 p-3.5 shadow-xs">
+                    <div className="text-[11px] font-semibold text-slate-500">
+                      Pieces Sold
+                    </div>
+                    <div className="mt-1 text-lg font-extrabold text-emerald-700">
+                      {palletMetrics.piecesSold.toLocaleString("en-PK")}
+                    </div>
+                  </div>
+
+                  <div
+                    className={`rounded-2xl border p-3.5 shadow-xs ${
+                      palletMetrics.piecesInStock < 0
+                        ? "bg-rose-50 border-rose-300"
+                        : "bg-white border-slate-200"
+                    }`}
+                  >
+                    <div className="text-[11px] font-semibold text-slate-500">
+                      Pieces in Stock
+                    </div>
+                    <div
+                      className={`mt-1 text-lg font-extrabold ${
+                        palletMetrics.piecesInStock < 0
+                          ? "text-rose-700"
+                          : "text-slate-900"
+                      }`}
+                    >
+                      {palletMetrics.piecesInStock.toLocaleString("en-PK")}
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl bg-rose-50 border border-rose-200 p-3.5 shadow-xs">
+                    <div className="text-[11px] font-semibold text-rose-700">
+                      Avg Landed Cost / Piece
+                    </div>
+                    <div className="mt-1 text-base font-extrabold text-rose-900">
+                      {formatPKR(palletMetrics.avgLandedCostPerPiece, 2)}
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl bg-emerald-50 border border-emerald-200 p-3.5 shadow-xs">
+                    <div className="text-[11px] font-semibold text-emerald-700">
+                      Avg Sale Price / Piece
+                    </div>
+                    <div className="mt-1 text-base font-extrabold text-emerald-900">
+                      {formatPKR(palletMetrics.avgSalePricePerPiece, 2)}
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl bg-emerald-50 border border-emerald-200 p-3.5 shadow-xs">
+                    <div className="text-[11px] font-semibold text-emerald-800">
+                      Estimated Gross Profit
+                    </div>
+                    <div className="mt-1 text-base font-extrabold text-emerald-900">
+                      {formatPKR(palletMetrics.estimatedGrossProfit)}
+                    </div>
+                    <div className="mt-0.5 text-[10px] font-medium text-emerald-700">
+                      Estimate (average cost)
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl bg-slate-100 border border-slate-200 p-3.5 shadow-xs">
+                    <div className="text-[11px] font-semibold text-slate-600">
+                      Estimated Stock Value
+                    </div>
+                    <div className="mt-1 text-base font-extrabold text-slate-900">
+                      {formatPKR(palletMetrics.estimatedStockValue)}
+                    </div>
+                    <div className="mt-0.5 text-[10px] font-medium text-slate-500">
+                      Estimate (average cost)
+                    </div>
+                  </div>
+                </div>
+
+                {palletMetrics.excludedLegacySalesCount > 0 && (
+                  <p className="text-[11px] text-slate-500 px-1">
+                    Note: {palletMetrics.excludedLegacySalesCount} legacy{" "}
+                    {palletMetrics.excludedLegacySalesCount === 1
+                      ? "sale"
+                      : "sales"}{" "}
+                    with 0 pieces{" "}
+                    {palletMetrics.excludedLegacySalesCount === 1
+                      ? "is"
+                      : "are"}{" "}
+                    excluded from per-piece averages and profit estimates.
+                  </p>
+                )}
+
+                {/* Pallets List (Newest First) */}
+                {palletMetrics.pallets.length === 0 ? (
                   <div className="rounded-2xl bg-white border border-slate-200 p-8 text-center text-xs text-slate-400">
                     <Layers className="w-7 h-7 mx-auto mb-2 opacity-40" />
-                    No bundle purchases recorded yet. Tap &ldquo;Buy
-                    Bundle&rdquo; to calculate landed per-piece costs.
+                    No pallet purchases recorded yet. Tap &ldquo;Buy
+                    Pallet&rdquo; to calculate landed per-piece costs.
                   </div>
                 ) : (
-                  clothCosting.map((item) => (
-                    <div
-                      key={item.clothType}
-                      className="rounded-2xl bg-rose-50 border border-rose-200 p-4 text-rose-900 shadow-xs"
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div>
-                          <h3 className="font-bold text-sm text-rose-950">
-                            {item.clothType}
-                          </h3>
-                          <p className="text-xs text-rose-700 mt-0.5">
-                            {item.bundlesCount}{" "}
-                            {item.bundlesCount === 1 ? "Bundle" : "Bundles"} •{" "}
-                            {item.totalPieces.toLocaleString("en-PK")} Pieces
-                          </p>
+                  <div className="space-y-2.5">
+                    {palletMetrics.pallets.map((pallet) => (
+                      <div
+                        key={pallet.id}
+                        className="rounded-2xl bg-rose-50 border border-rose-200 p-4 text-rose-900 shadow-xs"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <h3 className="font-bold text-sm text-rose-950">
+                                {pallet.palletNumber}
+                              </h3>
+                              <span className="text-[11px] text-rose-700 font-medium">
+                                {formatShortDate(pallet.txDate)}
+                              </span>
+                            </div>
+                            {pallet.supplierGrade && (
+                              <p className="text-xs text-rose-800 mt-0.5 break-words">
+                                {pallet.supplierGrade}
+                              </p>
+                            )}
+                          </div>
+
+                          <span className="px-2.5 py-1 rounded-full bg-rose-600 text-white text-xs font-extrabold shrink-0">
+                            {formatPKR(pallet.costPerPiece, 2)} / pc
+                          </span>
                         </div>
 
-                        <span className="px-2.5 py-1 rounded-full bg-rose-600 text-white text-xs font-extrabold shrink-0">
-                          {formatPKR(item.avgPerPiece, 2)} / pc
-                        </span>
-                      </div>
-
-                      <div className="mt-3 pt-2.5 border-t border-rose-200/80 grid grid-cols-3 gap-2 text-[11px]">
-                        <div>
-                          <div className="text-rose-700">Bundle Cost</div>
-                          <div className="font-bold text-rose-950">
-                            {formatPKR(item.totalBundlePrice)}
+                        <div className="mt-3 pt-2.5 border-t border-rose-200/80 grid grid-cols-3 gap-2 text-[11px]">
+                          <div>
+                            <div className="text-rose-700">Pieces</div>
+                            <div className="font-bold text-rose-950">
+                              {pallet.pieces.toLocaleString("en-PK")} pcs
+                            </div>
                           </div>
-                        </div>
-                        <div>
-                          <div className="text-rose-700">Trans + Labour</div>
-                          <div className="font-bold text-rose-950">
-                            {formatPKR(item.totalTransport + item.totalLabour)}
+                          <div>
+                            <div className="text-rose-700">Trans + Labour</div>
+                            <div className="font-bold text-rose-950">
+                              {formatPKR(
+                                pallet.transportCost + pallet.labourCost
+                              )}
+                            </div>
                           </div>
-                        </div>
-                        <div className="text-right">
-                          <div className="text-rose-700">Landed Spend</div>
-                          <div className="font-extrabold text-rose-800">
-                            {formatPKR(item.totalLandedSpend)}
+                          <div className="text-right">
+                            <div className="text-rose-700">Landed Cost</div>
+                            <div className="font-extrabold text-rose-800">
+                              {formatPKR(pallet.landedCost)}
+                            </div>
                           </div>
                         </div>
                       </div>
-                    </div>
-                  ))
+                    ))}
+                  </div>
                 )}
               </div>
             )}
@@ -1793,7 +1941,7 @@ export default function FurqanClothApp() {
           MODALS
          ======================================================================== */}
 
-      {/* 1. ADD / EDIT SALE MODAL */}
+      {/* 1. ADD / EDIT DAILY SALE MODAL */}
       {activeModal === "SALE" && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4">
           <div className="w-full max-w-lg bg-white rounded-t-3xl sm:rounded-3xl shadow-2xl overflow-hidden max-h-[92vh] overflow-y-auto">
@@ -1803,8 +1951,8 @@ export default function FurqanClothApp() {
                 {editingTx
                   ? editingTx.tx_type === "CAPITAL"
                     ? "Edit Opening Capital"
-                    : "Edit Cash Sale"
-                  : "Record Cash Sale"}
+                    : "Edit Daily Sales"
+                  : "Record Daily Sales"}
               </h2>
               <button
                 type="button"
@@ -1816,22 +1964,48 @@ export default function FurqanClothApp() {
             </div>
 
             <form onSubmit={handleSaveSale} className="p-5 space-y-4">
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1">
+                  Date
+                </label>
+                <input
+                  type="date"
+                  required
+                  value={saleDate}
+                  onChange={(e) => {
+                    setSaleDate(e.target.value);
+                    setConfirmDuplicateSaleDate(false);
+                  }}
+                  className="w-full px-3 py-2.5 rounded-xl border border-slate-300 text-sm font-medium focus:ring-2 focus:ring-emerald-500 focus:outline-none"
+                />
+              </div>
+
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-bold text-slate-600 mb-1">
-                    Date
+                    Pieces sold today
                   </label>
                   <input
-                    type="date"
-                    required
-                    value={saleDate}
-                    onChange={(e) => setSaleDate(e.target.value)}
-                    className="w-full px-3 py-2.5 rounded-xl border border-slate-300 text-sm font-medium focus:ring-2 focus:ring-emerald-500 focus:outline-none"
+                    type="number"
+                    inputMode="numeric"
+                    min="1"
+                    step="1"
+                    required={
+                      !(
+                        editingTx &&
+                        editingTx.tx_type === "SALE" &&
+                        Number(editingTx.pieces_count || 0) === 0
+                      )
+                    }
+                    placeholder="e.g. 24"
+                    value={salePiecesCount}
+                    onChange={(e) => setSalePiecesCount(e.target.value)}
+                    className="w-full px-3 py-2.5 rounded-xl border border-slate-300 text-sm font-bold focus:ring-2 focus:ring-emerald-500 focus:outline-none"
                   />
                 </div>
                 <div>
                   <label className="block text-xs font-bold text-slate-600 mb-1">
-                    Cash Received (PKR)
+                    Total cash received (PKR)
                   </label>
                   <input
                     type="number"
@@ -1847,19 +2021,11 @@ export default function FurqanClothApp() {
                 </div>
               </div>
 
-              <div>
-                <label className="block text-xs font-bold text-slate-600 mb-1">
-                  Category
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={saleCategory}
-                  onChange={(e) => setSaleCategory(e.target.value)}
-                  placeholder="Daily Cash Sales"
-                  className="w-full px-3 py-2.5 rounded-xl border border-slate-300 text-sm font-medium focus:ring-2 focus:ring-emerald-500 focus:outline-none"
-                />
-              </div>
+              {salePricePerPiece !== null && (
+                <div className="rounded-xl bg-emerald-50 border border-emerald-200 px-3.5 py-2.5 text-xs font-bold text-emerald-800">
+                  Average price per piece: {formatPKR(salePricePerPiece, 2)}
+                </div>
+              )}
 
               <div>
                 <label className="block text-xs font-bold text-slate-600 mb-1">
@@ -1869,10 +2035,21 @@ export default function FurqanClothApp() {
                   type="text"
                   value={saleNotes}
                   onChange={(e) => setSaleNotes(e.target.value)}
-                  placeholder="e.g. Morning counter sales"
+                  placeholder="e.g. Full day counter sales"
                   className="w-full px-3 py-2.5 rounded-xl border border-slate-300 text-sm focus:ring-2 focus:ring-emerald-500 focus:outline-none"
                 />
               </div>
+
+              {!editingTx && hasExistingSaleForDate && (
+                <div className="rounded-xl bg-amber-50 border border-amber-300 px-3.5 py-2.5 text-xs font-semibold text-amber-900">
+                  A sale for this date already exists, save anyway?
+                  {confirmDuplicateSaleDate && (
+                    <span className="block mt-1 font-bold">
+                      Tap the button again to confirm and save.
+                    </span>
+                  )}
+                </div>
+              )}
 
               <button
                 type="submit"
@@ -1882,15 +2059,17 @@ export default function FurqanClothApp() {
                 {submitting
                   ? "Saving..."
                   : editingTx
-                  ? "Update Entry"
-                  : "Save Cash Sale"}
+                  ? "Update Daily Sales"
+                  : confirmDuplicateSaleDate
+                  ? "Save Anyway"
+                  : "Save Daily Sales"}
               </button>
             </form>
           </div>
         </div>
       )}
 
-      {/* 2. ADD / EDIT BUNDLE PURCHASE MODAL (LANDED COSTING) */}
+      {/* 2. ADD / EDIT PALLET PURCHASE MODAL (LANDED COSTING) */}
       {activeModal === "PURCHASE" && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4">
           <div className="w-full max-w-lg bg-white rounded-t-3xl sm:rounded-3xl shadow-2xl overflow-hidden max-h-[92vh] overflow-y-auto">
@@ -1898,8 +2077,8 @@ export default function FurqanClothApp() {
               <h2 className="font-bold text-base flex items-center gap-2">
                 <Package className="w-5 h-5" />
                 {editingTx
-                  ? "Edit Bundle Purchase"
-                  : "Buy Cloth Bundle (Landed Cost)"}
+                  ? "Edit Pallet Purchase"
+                  : "Buy Pallet (Landed Cost)"}
               </h2>
               <button
                 type="button"
@@ -1911,6 +2090,18 @@ export default function FurqanClothApp() {
             </div>
 
             <form onSubmit={handleSavePurchase} className="p-5 space-y-4">
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1">
+                  Pallet Number
+                </label>
+                <input
+                  type="text"
+                  readOnly
+                  value={palletNumber}
+                  className="w-full px-3 py-2.5 rounded-xl border border-slate-300 bg-slate-100 text-sm font-bold text-slate-700 cursor-not-allowed focus:outline-none"
+                />
+              </div>
+
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-bold text-slate-600 mb-1">
@@ -1926,14 +2117,15 @@ export default function FurqanClothApp() {
                 </div>
                 <div>
                   <label className="block text-xs font-bold text-slate-600 mb-1">
-                    Number of Pieces
+                    Pieces in pallet
                   </label>
                   <input
                     type="number"
                     inputMode="numeric"
                     min="1"
+                    step="1"
                     required
-                    placeholder="e.g. 120"
+                    placeholder="e.g. 160"
                     value={piecesCount}
                     onChange={(e) => setPiecesCount(e.target.value)}
                     className="w-full px-3 py-2.5 rounded-xl border border-slate-300 text-sm font-bold focus:ring-2 focus:ring-rose-500 focus:outline-none"
@@ -1943,24 +2135,7 @@ export default function FurqanClothApp() {
 
               <div>
                 <label className="block text-xs font-bold text-slate-600 mb-1">
-                  Cloth Type
-                </label>
-                <select
-                  value={clothType}
-                  onChange={(e) => setClothType(e.target.value)}
-                  className="w-full px-3 py-2.5 rounded-xl border border-slate-300 text-sm font-semibold bg-white focus:ring-2 focus:ring-rose-500 focus:outline-none"
-                >
-                  {CLOTH_TYPES.map((type) => (
-                    <option key={type} value={type}>
-                      {type}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-600 mb-1">
-                  1 Bundle Price (PKR)
+                  Pallet Price (PKR)
                 </label>
                 <input
                   type="number"
@@ -1968,9 +2143,9 @@ export default function FurqanClothApp() {
                   min="0"
                   step="any"
                   required
-                  placeholder="e.g. 28000"
-                  value={bundlePrice}
-                  onChange={(e) => setBundlePrice(e.target.value)}
+                  placeholder="e.g. 22000"
+                  value={palletPrice}
+                  onChange={(e) => setPalletPrice(e.target.value)}
                   className="w-full px-3 py-2.5 rounded-xl border border-slate-300 text-sm font-bold text-rose-800 focus:ring-2 focus:ring-rose-500 focus:outline-none"
                 />
               </div>
@@ -2008,13 +2183,13 @@ export default function FurqanClothApp() {
 
               <div>
                 <label className="block text-xs font-bold text-slate-600 mb-1">
-                  Supplier / Notes (Optional)
+                  Supplier / Grade (Optional)
                 </label>
                 <input
                   type="text"
-                  value={purchaseNotes}
-                  onChange={(e) => setPurchaseNotes(e.target.value)}
-                  placeholder="e.g. Shershah market grade-A"
+                  value={supplierGrade}
+                  onChange={(e) => setSupplierGrade(e.target.value)}
+                  placeholder="e.g. Shershah Grade-A mixed"
                   className="w-full px-3 py-2.5 rounded-xl border border-slate-300 text-sm focus:ring-2 focus:ring-rose-500 focus:outline-none"
                 />
               </div>
@@ -2022,18 +2197,18 @@ export default function FurqanClothApp() {
               {/* Live Landed Cost Preview */}
               <div className="rounded-2xl bg-rose-50 border border-rose-200 p-4 space-y-2">
                 <div className="flex items-center justify-between text-xs text-rose-800">
-                  <span className="font-semibold">Total Bundle Outflow</span>
+                  <span className="font-semibold">Total Pallet Outflow</span>
                   <span className="font-extrabold text-sm text-rose-900">
-                    -{formatPKR(bundlePreview.totalOutflow)}
+                    -{formatPKR(palletPreview.totalOutflow)}
                   </span>
                 </div>
                 <div className="flex items-center justify-between pt-2 border-t border-rose-200">
                   <span className="text-xs font-bold text-rose-900 flex items-center gap-1">
                     <Calculator className="w-4 h-4 text-rose-600" />
-                    Calculated Per-Piece Cost
+                    Landed Cost per Piece
                   </span>
                   <span className="px-3 py-1 rounded-full bg-rose-600 text-white text-sm font-extrabold">
-                    {formatPKR(bundlePreview.perPiece, 2)} / pc
+                    {formatPKR(palletPreview.perPiece, 2)} / pc
                   </span>
                 </div>
               </div>
@@ -2046,8 +2221,8 @@ export default function FurqanClothApp() {
                 {submitting
                   ? "Saving..."
                   : editingTx
-                  ? "Update Bundle Purchase"
-                  : "Save Bundle Purchase"}
+                  ? "Update Pallet Purchase"
+                  : "Save Pallet Purchase"}
               </button>
             </form>
           </div>
@@ -2443,7 +2618,7 @@ export default function FurqanClothApp() {
                 Reset All Ledger Data?
               </h2>
               <p className="text-xs text-slate-600 leading-relaxed">
-                This will permanently delete all sales, bundle purchases, and
+                This will permanently delete all sales, pallet purchases, and
                 expenses, and restore the starting{" "}
                 <span className="font-bold text-slate-900">400,000 PKR</span>{" "}
                 Opening Capital.
